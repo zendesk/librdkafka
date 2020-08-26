@@ -156,7 +156,7 @@ typedef enum {
 
 /* Increase in steps of 64 as needed.
  * This must be larger than sizeof(rd_kafka_[topic_]conf_t) */
-#define RD_KAFKA_CONF_PROPS_IDX_MAX (64*27)
+#define RD_KAFKA_CONF_PROPS_IDX_MAX (64*30)
 
 /**
  * @struct rd_kafka_anyconf_t
@@ -222,6 +222,7 @@ struct rd_kafka_conf_s {
 #if WITH_SSL
         struct {
                 SSL_CTX *ctx;
+                rwlock_t ctx_lock;
                 char *cipher_suites;
 #if OPENSSL_VERSION_NUMBER >= 0x1000200fL && !defined(LIBRESSL_VERSION_NUMBER)
                 char *curves_list;

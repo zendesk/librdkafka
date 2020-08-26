@@ -7012,6 +7012,21 @@ RD_EXPORT
 rd_kafka_error_t *
 rd_kafka_abort_transaction (rd_kafka_t *rk, int timeout_ms);
 
+/**
+ * @brief Creates a new SSL context, causing certificates to be re-read from disk
+ *
+ * @param rk Client instance.
+ * @param errstr A human readable error string (nul-terminated) is written to
+ *               this location that must be of at least \p errstr_size bytes.
+ *               The \p errstr is only written to if there is a fatal error.
+ * @param errstr_size Writable size in \p errstr.
+ *
+ *
+ * @returns 0 if it worked, else non-zero (consult errstr for details)
+ */
+RD_EXPORT
+int rd_kafka_ssl_refresh (rd_kafka_t *rk, char *errstr, size_t errstr_size);
+
 
 /**@}*/
 
