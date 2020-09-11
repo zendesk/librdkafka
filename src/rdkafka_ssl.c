@@ -417,6 +417,123 @@ rd_kafka_transport_ssl_cert_verify_cb (int preverify_ok,
         return 1; /* verification successful */
 }
 
+#if OPENSSL_VERSION_NUMBER >= 0x1000200fL && !defined(LIBRESSL_VERSION_NUMBER)
+static int rd_kafka_transport_ssl_cert_fetch_cb(SSL *ssl, void *arg) {
+        rd_kafka_transport_t *rktrans = rd_kafka_curr_transport;
+        rd_kafka_broker_t *rkb;
+        rd_kafka_t *rk;
+        int r;
+        int i;
+        int ret;
+        int num_chain_certs;
+
+        rd_assert(rktrans != NULL);
+        rkb = rktrans->rktrans_rkb;
+        rk = rkb->rkb_rk;
+
+        rd_kafka_cert_fetch_cb_res_t cb_res;
+        size_t buf_size = 0; // start with zero to probe callback for correct size
+        char *buf = NULL;
+        char *leaf_cert_ptr;
+        char *pkey_ptr;
+        char *chain_cert_ptrs[16] = { 0 };
+        size_t leaf_cert_size;
+        size_t pkey_size;
+        size_t chain_cert_sizes[16] = { 0 };
+        rd_kafka_cert_enc_t format;
+
+        char errstr[512] = { 0 };
+        rd_kafka_cert_t *leaf_cert = NULL;
+        rd_kafka_cert_t *pkey = NULL;
+
+        do {
+                if (buf) rd_kafka_mem_free(rk, buf);
+                buf = rd_calloc(1, buf_size);
+                cb_res = rk->rk_conf.ssl.cert_fetch_cb(rk,rkb->rkb_nodename, rkb->rkb_nodeid,
+                                                       buf, &buf_size,
+                                                       &leaf_cert_ptr, &leaf_cert_size,
+                                                       &pkey_ptr, &pkey_size,
+                                                       chain_cert_ptrs, chain_cert_sizes,
+                                                       &format,
+                                                       rk->rk_conf.opaque);
+        } while (cb_res == RD_KAFKA_CERT_FETCH_MORE_BUFFER);
+
+        if (cb_res == RD_KAFKA_CERT_FETCH_NONE) {
+                ret = 1;
+                goto out;
+        } else if (cb_res == RD_KAFKA_CERT_FETCH_ERR) {
+                ret = 0;
+                goto out;
+        }
+
+        leaf_cert = rd_kafka_cert_new(&rk->rk_conf, RD_KAFKA_CERT_PUBLIC_KEY, format,
+                                      leaf_cert_ptr, leaf_cert_size, errstr, sizeof(errstr));
+        if (!leaf_cert) {
+                rd_rkb_log(rkb, LOG_ERR, "SSLCERTFETCH",
+                           "Certificate fetch callback leaf cert parsing failed: %s", errstr);
+                ret = 0;
+                goto out;
+        }
+        r = SSL_use_certificate(ssl, leaf_cert->x509);
+        rd_kafka_cert_destroy(leaf_cert);
+        if (r != 1) {
+                rd_kafka_ssl_error(rk, rkb, errstr, sizeof(errstr));
+                rd_rkb_log(rkb, LOG_ERR, "SSLCERTFETCH",
+                           "Certificate fetch callback leaf cert loading failed: %s", errstr);
+                ret = 0;
+                goto out;
+        }
+
+        pkey = rd_kafka_cert_new(&rk->rk_conf, RD_KAFKA_CERT_PRIVATE_KEY, format,
+                                 pkey_ptr, pkey_size, errstr, sizeof(errstr));
+        if (!pkey) {
+                rd_rkb_log(rkb, LOG_ERR, "SSLCERTFETCH",
+                           "Certificate fetch callback private key parsing failed: %s", errstr);
+                ret = 0;
+                goto out;
+        }
+        r = SSL_use_PrivateKey(ssl, pkey->pkey);
+        rd_kafka_cert_destroy(pkey);
+        if (r != 1) {
+                rd_kafka_ssl_error(rk, rkb, errstr, sizeof(errstr));
+                rd_rkb_log(rkb, LOG_ERR, "SSLCERTFETCH",
+                           "Certificate fetch callback private key loading failed: %s", errstr);
+                ret = 0;
+                goto out;
+        }
+
+        num_chain_certs = sizeof(chain_cert_ptrs)/sizeof(chain_cert_ptrs[0]);
+        for (i = 0; i < num_chain_certs; i++) {
+                if (!chain_cert_ptrs[i]) continue;
+
+                rd_kafka_cert_t *chain_cert = rd_kafka_cert_new(&rk->rk_conf, RD_KAFKA_CERT_PUBLIC_KEY, format,
+                                                                chain_cert_ptrs[i], chain_cert_sizes[i],
+                                                                errstr, sizeof(errstr));
+                if (!chain_cert) {
+                        rd_rkb_log(rkb, LOG_ERR, "SSLCERTFETCH",
+                                   "Certificate fetch callback chain cert parsing failed: %s", errstr);
+                        ret = 0;
+                        goto out;
+                }
+                r = SSL_add1_chain_cert(ssl, chain_cert->x509);
+                rd_kafka_cert_destroy(chain_cert);
+                if (r != 1) {
+                        rd_kafka_ssl_error(rk, rkb, errstr, sizeof(errstr));
+                        rd_rkb_log(rkb, LOG_ERR, "SSLCERTFETCH",
+                                   "Certificate fetch callback chain cert loading failed: %s", errstr);
+                        ret = 0;
+                        goto out;
+                }
+        }
+
+        ret = 1;
+
+out:
+        if (buf) rd_kafka_mem_free(rkb->rkb_rk, buf);
+        return ret;
+}
+#endif
+
 /**
  * @brief Set TLSEXT hostname for SNI and optionally enable
  *        SSL endpoint identification verification.
@@ -1363,6 +1480,10 @@ int rd_kafka_ssl_ctx_init (rd_kafka_t *rk, char *errstr, size_t errstr_size) {
                            rd_kafka_transport_ssl_cert_verify_cb : NULL);
 
 #if OPENSSL_VERSION_NUMBER >= 0x1000200fL && !defined(LIBRESSL_VERSION_NUMBER)
+        if (rk->rk_conf.ssl.cert_fetch_cb) {
+                SSL_CTX_set_cert_cb(ctx, rd_kafka_transport_ssl_cert_fetch_cb, NULL);
+        }
+
         /* Curves */
         if (rk->rk_conf.ssl.curves_list) {
                 rd_kafka_dbg(rk, SECURITY, "SSL",

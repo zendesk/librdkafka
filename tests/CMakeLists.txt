@@ -113,6 +113,7 @@ set(
     0119-consumer_auth.cpp
     0120-asymmetric_subscription.c
     0121-clusterid.c
+    0122-ssl_cb.c
     8000-idle.cpp
     test.c
     testcpp.cpp

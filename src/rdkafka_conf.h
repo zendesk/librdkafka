@@ -250,6 +250,15 @@ struct rd_kafka_conf_s {
                                        const char *buf, size_t size,
                                        char *errstr, size_t errstr_size,
                                        void *opaque);
+				int (*cert_fetch_cb) (rd_kafka_t *rk,
+                                      const char *broker_name,
+                                      int32_t broker_id,
+                                      char *buf, size_t *buf_size,
+                                      char **leaf_cert, size_t *leaf_cert_size,
+                                      char **pkey, size_t *pkey_size,
+                                      char *chain_cert[16], size_t chain_cert_size[16],
+                                      rd_kafka_cert_enc_t *format,
+                                      void *opaque);
         } ssl;
 
         struct {
