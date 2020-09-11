@@ -14,6 +14,8 @@ from trivup.apps.KerberosKdcApp import KerberosKdcApp
 import json
 import subprocess
 
+from cluster_testing import create_selfsigned_cert, create_cert_via_intermediate
+
 
 class LibrdkafkaTestApp(App):
     """ Sets up and executes the librdkafka regression tests.
@@ -108,6 +110,27 @@ class LibrdkafkaTestApp(App):
                         self.env_add('RDK_SSL_{}_{}'.format(k, k2), v2)
                 else:
                     self.env_add('RDK_SSL_{}'.format(k), v)
+
+            # Also create some invalid certificates, that can be used by tests that want to ensure
+            # untrusted certs fail
+            selfsigned_key = create_selfsigned_cert(ssl, "librdkafka%s-untrusted" % self.appid)
+            for k, v in selfsigned_key.items():
+                if type(v) is dict:
+                    for k2, v2 in v.items():
+                        # E.g. "RDK_UNTRUSTEDSSL_priv_der=path/to/librdkafka-priv.der"
+                        self.env_add('RDK_UNTRUSTEDSSL_{}_{}'.format(k, k2), v2)
+                else:
+                    self.env_add('RDK_UNTRUSTEDSSL_{}'.format(k), )
+
+            # Also create some certificates signed via an intermediate
+            selfsigned_key = create_cert_via_intermediate(ssl, "librdkafka%s-via-intermediate" % self.appid)
+            for k, v in selfsigned_key.items():
+                if type(v) is dict:
+                    for k2, v2 in v.items():
+                        # E.g. "RDK_INTERMEDIATESSL_priv_der=path/to/librdkafka-priv.der"
+                        self.env_add('RDK_INTERMEDIATESSL_{}_{}'.format(k, k2), v2)
+                else:
+                    self.env_add('RDK_INTERMEDIATESSL_{}'.format(k), v)
 
 
             if 'SASL' in self.security_protocol:

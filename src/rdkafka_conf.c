@@ -306,6 +306,7 @@ static const struct rd_kafka_property rd_kafka_properties[] = {
                         },
                         { 0x400, "zstd", _UNSUPPORTED_ZSTD },
                         { 0x800, "sasl_oauthbearer", _UNSUPPORTED_SSL },
+                        { 0x1000, "ssl_client_cert_callback", _UNSUPPORTED_OPENSSL_1_0_2 },
                         { 0, NULL }
                 }
 	},
@@ -851,7 +852,11 @@ static const struct rd_kafka_property rd_kafka_properties[] = {
           "Callback to verify the broker certificate chain.",
           _UNSUPPORTED_SSL
         },
-
+        { _RK_GLOBAL, "ssl.certificate.fetch_cb", _RK_C_PTR,
+          _RK(ssl.cert_fetch_cb),
+          "Callback to fetch a client certificate. Requires OpenSSL >= 1.0.2.",
+          _UNSUPPORTED_OPENSSL_1_0_2
+        },
         /* Point user in the right direction if they try to apply
          * Java client SSL / JAAS properties. */
         { _RK_GLOBAL, "ssl.truststore.location", _RK_C_INVALID,
@@ -2811,6 +2816,27 @@ rd_kafka_conf_set_ssl_cert_verify_cb (
                                       "ssl.certificate.verify_cb",
                                       ssl_cert_verify_cb);
         return RD_KAFKA_CONF_OK;
+#endif
+}
+
+rd_kafka_conf_res_t
+rd_kafka_conf_set_ssl_cert_fetch_cb(
+		rd_kafka_conf_t *conf,
+        int (*ssl_cert_fetch_cb) (rd_kafka_t *rk,
+                                  const char *broker_name,
+                                  int32_t broker_id,
+                                  char *buf, size_t *buf_size,
+                                  char **leaf_cert, size_t *leaf_cert_size,
+                                  char **pkey, size_t *pkey_size,
+                                  char *chain_cert[16], size_t chain_cert_size[16],
+                                  rd_kafka_cert_enc_t *format,
+                                  void *opaque)) {
+
+#if defined(WITH_SSL) && OPENSSL_VERSION_NUMBER >= 0x1000200fL
+    rd_kafka_anyconf_set_internal(_RK_GLOBAL, conf,"ssl.certificate.fetch_cb", ssl_cert_fetch_cb);
+    return RD_KAFKA_CONF_OK;
+#else
+    return RD_KAFKA_CONF_INVALID;
 #endif
 }
 
