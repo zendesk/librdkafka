@@ -612,7 +612,10 @@ int rd_kafka_transport_ssl_connect (rd_kafka_broker_t *rkb,
                                     char *errstr, size_t errstr_size) {
         int r;
 
+        rwlock_rdlock(&rkb->rkb_rk->rk_conf.ssl.ctx_lock);
         rktrans->rktrans_ssl = SSL_new(rkb->rkb_rk->rk_conf.ssl.ctx);
+        rwlock_rdunlock(&rkb->rkb_rk->rk_conf.ssl.ctx_lock);
+
         if (!rktrans->rktrans_ssl)
                 goto fail;
 
@@ -1404,16 +1407,17 @@ static int rd_kafka_ssl_set_certs (rd_kafka_t *rk, SSL_CTX *ctx,
 void rd_kafka_ssl_ctx_term (rd_kafka_t *rk) {
         SSL_CTX_free(rk->rk_conf.ssl.ctx);
         rk->rk_conf.ssl.ctx = NULL;
+        rwlock_destroy(&rk->rk_conf.ssl.ctx_lock);
 }
 
 /**
- * @brief Once per rd_kafka_t handle initialization of OpenSSL
+ * @brief Constructs a new SSL context and stores it in rk->rk_conf.ssl.ctx
  *
  * @locality application thread
  *
  * @locks rd_kafka_wrlock() MUST be held
  */
-int rd_kafka_ssl_ctx_init (rd_kafka_t *rk, char *errstr, size_t errstr_size) {
+static int rd_kafka_ssl_ctx_new (rd_kafka_t *rk, char *errstr, size_t errstr_size) {
         int r;
         SSL_CTX *ctx;
         const char *linking =
@@ -1531,6 +1535,21 @@ int rd_kafka_ssl_ctx_init (rd_kafka_t *rk, char *errstr, size_t errstr_size) {
         return -1;
 }
 
+/**
+ * @brief Once per rd_kafka_t handle initialization of OpenSSL
+ *
+ * @locality application thread
+ *
+ * @locks rd_kafka_wrlock() MUST be held
+ */
+int rd_kafka_ssl_ctx_init (rd_kafka_t *rk, char *errstr, size_t errstr_size) {
+        int r = rd_kafka_ssl_ctx_new(rk, errstr, errstr_size);
+        if (r == 0) {
+                rwlock_init(&rk->rk_conf.ssl.ctx_lock);
+        }
+        return r;
+}
+
 
 #if OPENSSL_VERSION_NUMBER < 0x10100000L
 static RD_UNUSED void
@@ -1622,4 +1641,26 @@ void rd_kafka_ssl_init (void) {
         ERR_load_crypto_strings();
         OpenSSL_add_all_algorithms();
 #endif
+}
+
+/**
+ * @brief Creates a new SSL context, causing certificates to be re-read from disk
+ */
+int rd_kafka_ssl_refresh (rd_kafka_t *rk, char *errstr, size_t errstr_size) {
+        SSL_CTX *old_ctx;
+        int succ;
+
+        rd_kafka_wrlock(rk);
+        rwlock_wrlock(&rk->rk_conf.ssl.ctx_lock);
+
+        old_ctx = rk->rk_conf.ssl.ctx;
+        succ = rd_kafka_ssl_ctx_new(rk, errstr, errstr_size);
+        if (succ == 0 && old_ctx != NULL) {
+                SSL_CTX_free(old_ctx);
+        }
+
+        rwlock_wrunlock(&rk->rk_conf.ssl.ctx_lock);
+        rd_kafka_wrunlock(rk);
+
+        return succ;
 }
