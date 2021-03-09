@@ -2878,6 +2878,12 @@ static void rd_kafka_cgrp_offsets_commit (rd_kafka_cgrp_t *rkcg,
         rd_kafka_buf_t *rkbuf;
         rd_kafka_op_t *reply;
 
+        if (!(rko->rko_flags & RD_KAFKA_OP_F_REPROCESS)) {
+                /* wait_commit_cnt has already been increased for
+                 * reprocessed ops. */
+                rkcg->rkcg_rk->rk_consumer.wait_commit_cnt++;
+        }
+
         /* If offsets is NULL we shall use the current assignment
          * (not the group assignment). */
         if (!rko->rko_u.offset_commit.partitions &&
@@ -2907,12 +2913,6 @@ static void rd_kafka_cgrp_offsets_commit (rd_kafka_cgrp_t *rkcg,
                 valid_offsets = (int)rd_kafka_topic_partition_list_sum(
                         offsets,
                         rd_kafka_topic_partition_has_absolute_offset, NULL);
-        }
-
-        if (!(rko->rko_flags & RD_KAFKA_OP_F_REPROCESS)) {
-                /* wait_commit_cnt has already been increased for
-                 * reprocessed ops. */
-                rkcg->rkcg_rk->rk_consumer.wait_commit_cnt++;
         }
 
         if (rd_kafka_fatal_error_code(rkcg->rkcg_rk)) {
@@ -4945,9 +4945,6 @@ static void rd_kafka_cgrp_join_state_serve (rd_kafka_cgrp_t *rkcg) {
 		break;
 
         case RD_KAFKA_CGRP_JOIN_STATE_STEADY:
-                if (rd_kafka_cgrp_session_timeout_check(rkcg, now))
-                        return;
-                /* FALLTHRU */
         case RD_KAFKA_CGRP_JOIN_STATE_WAIT_ASSIGN_CALL:
         case RD_KAFKA_CGRP_JOIN_STATE_WAIT_UNASSIGN_CALL:
                 if (rkcg->rkcg_flags & RD_KAFKA_CGRP_F_SUBSCRIPTION &&
@@ -4992,6 +4989,11 @@ void rd_kafka_cgrp_serve (rd_kafka_cgrp_t *rkcg) {
         /* Bail out if we're terminating. */
         if (unlikely(rd_kafka_terminating(rkcg->rkcg_rk)))
                 return;
+
+        /* Check session timeout regardless of current coordinator
+         * connection state (rkcg_state) */
+        if (rkcg->rkcg_join_state == RD_KAFKA_CGRP_JOIN_STATE_STEADY)
+                rd_kafka_cgrp_session_timeout_check(rkcg, now);
 
  retry:
         switch (rkcg->rkcg_state)

@@ -1,3 +1,61 @@
+# librdkafka v1.6.1
+
+librdkafka v1.6.1 is a maintenance release.
+
+## Upgrade considerations
+
+ * Fatal idempotent producer errors are now also fatal to the transactional
+   producer. This is a necessary step to maintain data integrity prior to
+   librdkafka supporting KIP-360. Applications should check any transactional
+   API errors for the is_fatal flag and decommission the transactional producer
+   if the flag is set.
+ * The consumer error raised by `auto.offset.reset=error` now has error-code
+   set to `ERR__AUTO_OFFSET_RESET` to allow an application to differentiate
+   between auto offset resets and other consumer errors.
+
+
+## Fixes
+
+### General fixes
+
+ * Admin API and transactional `send_offsets_to_transaction()` coordinator
+   requests, such as TxnOffsetCommitRequest, could in rare cases be sent
+   multiple times which could cause a crash.
+ * `ssl.ca.location=probe` is now enabled by default on Mac OSX since the
+   librdkafka-bundled OpenSSL might not have the same default CA search paths
+   as the system or brew installed OpenSSL. Probing scans all known locations.
+
+### Transactional Producer fixes
+
+ * Fatal idempotent producer errors are now also fatal to the transactional
+   producer.
+ * The transactional producer could crash if the transaction failed while
+   `send_offsets_to_transaction()` was called.
+ * Group coordinator requests for transactional
+   `send_offsets_to_transaction()` calls would leak memory if the
+   underlying request was attempted to be sent after the transaction had
+   failed.
+ * When gradually producing to multiple partitions (resulting in multiple
+   underlying AddPartitionsToTxnRequests) sub-sequent partitions could get
+   stuck in pending state under certain conditions. These pending partitions
+   would not send queued messages to the broker and eventually trigger
+   message timeouts, failing the current transaction. This is now fixed.
+ * Committing an empty transaction (no messages were produced and no
+   offsets were sent) would previously raise a fatal error due to invalid state
+   on the transaction coordinator. We now allow empty/no-op transactions to
+   be committed.
+
+### Consumer fixes
+
+ * The consumer will now retry indefinitely (or until the assignment is changed)
+   to retrieve committed offsets. This fixes the issue where only two retries
+   were attempted when outstanding transactions were blocking OffsetFetch
+   requests with `ERR_UNSTABLE_OFFSET_COMMIT`. #3265
+
+
+
+
+
 # librdkafka v1.6.0
 
 librdkafka v1.6.0 is feature release:
@@ -12,6 +70,7 @@ librdkafka v1.6.0 is feature release:
  * [KIP-447 Producer scalability for exactly once semantics](https://cwiki.apache.org/confluence/display/KAFKA/KIP-447%3A+Producer+scalability+for+exactly+once+semantics) -
    allows a single transactional producer to be used for multiple input
    partitions. Requires Apache Kafka 2.5 or later.
+ * Transactional producer fixes and improvements, see **Transactional Producer fixes** below.
  * The [librdkafka.redist](https://www.nuget.org/packages/librdkafka.redist/)
    NuGet package now supports Linux ARM64/Aarch64.
 
@@ -29,6 +88,17 @@ librdkafka v1.6.0 is feature release:
    supported on Apache Kafka 2.5 or later, on earlier releases you will
    need to use one producer per input partition for EOS. This limitation
    is not enforced by the producer or broker.
+ * Error handling for the transactional producer has been improved, see
+   the **Transactional Producer fixes** below for more information.
+
+
+## Known issues
+
+ * The Transactional Producer's API timeout handling is inconsistent with the
+   underlying protocol requests, it is therefore strongly recommended that
+   applications call `rd_kafka_commit_transaction()` and
+   `rd_kafka_abort_transaction()` with the `timeout_ms` parameter
+   set to `-1`, which will use the remaining transaction timeout.
 
 
 ## Enhancements
@@ -45,7 +115,7 @@ librdkafka v1.6.0 is feature release:
    contention (@azat).
  * Added `assignor` debug context for troubleshooting consumer partition
    assignments.
- * Updated to OpenSSL v1.1.1h when building dependencies.
+ * Updated to OpenSSL v1.1.1i when building dependencies.
  * Update bundled lz4 (used when `./configure --disable-lz4-ext`) to v1.9.3
    which has vast performance improvements.
  * Added `rd_kafka_conf_get_default_topic_conf()` to retrieve the
@@ -76,14 +146,25 @@ librdkafka v1.6.0 is feature release:
    a number of edge cases for the consumer where the behaviour was previously
    undefined.
  * Partition fetch state was not set to STOPPED if OffsetCommit failed.
+ * The session timeout is now enforced locally also when the coordinator
+   connection is down, which was not previously the case.
 
-### Producer fixes
 
- * Calling `rd_kafka_topic_new()` with a topic config object with
-   `message.timeout.ms` set could sometimes adjust the global `linger.ms`
-   property (if not explicitly configured) which was not desired, this is now
-   fixed and the auto adjustment is only done based on the
-   `default_topic_conf` at producer creation.
+### Transactional Producer fixes
+
+ * Transaction commit or abort failures on the broker, such as when the
+   producer was fenced by a newer instance, were not propagated to the
+   application resulting in failed commits seeming successful.
+   This was a critical race condition for applications that had a delay after
+   producing messages (or sendings offsets) before committing or
+   aborting the transaction. This issue has now been fixed and test coverage
+   improved.
+ * The transactional producer API would return `RD_KAFKA_RESP_ERR__STATE`
+   when API calls were attempted after the transaction had failed, we now
+   try to return the error that caused the transaction to fail in the first
+   place, such as `RD_KAFKA_RESP_ERR__FENCED` when the producer has
+   been fenced, or `RD_KAFKA_RESP_ERR__TIMED_OUT` when the transaction
+   has timed out.
  * Transactional producer retry count for transactional control protocol
    requests has been increased from 3 to infinite, retriable errors
    are now automatically retried by the producer until success or the
@@ -92,6 +173,19 @@ librdkafka v1.6.0 is feature release:
    transaction into an abortable state when `CONCURRENT_TRANSACTIONS` was
    returned by the broker (which is a transient error) and the 3 retries
    were exhausted.
+
+
+### Producer fixes
+
+ * Calling `rd_kafka_topic_new()` with a topic config object with
+   `message.timeout.ms` set could sometimes adjust the global `linger.ms`
+   property (if not explicitly configured) which was not desired, this is now
+   fixed and the auto adjustment is only done based on the
+   `default_topic_conf` at producer creation.
+ * `rd_kafka_flush()` could previously return `RD_KAFKA_RESP_ERR__TIMED_OUT`
+   just as the timeout was reached if the messages had been flushed but
+   there were now no more messages. This has been fixed.
+
 
 
 
@@ -132,6 +226,10 @@ librdkafka v1.5.3 is a maintenance release.
    endless loop or generate uneven assignments in case the group members
    had asymmetric subscriptions (e.g., c1 subscribes to t1,t2 while c2
    subscribes to t2,t3).  (#3159)
+ * Mixing committed and logical or absolute offsets in the partitions
+   passed to `rd_kafka_assign()` would in previous released ignore the
+   logical or absolute offsets and use the committed offsets for all partitions.
+   This is now fixed. (#2938)
 
 
 

@@ -111,7 +111,7 @@ namespace RdKafka {
  * @remark This value should only be used during compile time,
  *         for runtime checks of version use RdKafka::version()
  */
-#define RD_KAFKA_VERSION  0x010600ff
+#define RD_KAFKA_VERSION  0x010601ff
 
 /**
  * @brief Returns the librdkafka version as integer.
@@ -294,6 +294,8 @@ enum ErrorCode {
         ERR__ASSIGNMENT_LOST = -142,
         /** No operation performed */
         ERR__NOOP = -141,
+        /** No offset to automatically reset to */
+        ERR__AUTO_OFFSET_RESET = -140,
 
         /** End internal error codes */
 	ERR__END = -100,
@@ -3292,6 +3294,13 @@ class RD_EXPORT Producer : public virtual Handle {
    * @param timeout_ms The maximum time to block. On timeout the operation
    *                   may continue in the background, depending on state,
    *                   and it is okay to call this function again.
+   *                   Pass -1 to use the remaining transaction timeout,
+   *                   this is the recommended use.
+   *
+   * @remark It is strongly recommended to always pass -1 (remaining transaction
+   *         time) as the \p timeout_ms. Using other values risk internal
+   *         state desynchronization in case any of the underlying protocol
+   *         requests fail.
    *
    * @returns an RdKafka::Error object on error, or NULL on success.
    *          Check whether the returned error object permits retrying
@@ -3319,6 +3328,13 @@ class RD_EXPORT Producer : public virtual Handle {
    * @param timeout_ms The maximum time to block. On timeout the operation
    *                   may continue in the background, depending on state,
    *                   and it is okay to call this function again.
+   *                   Pass -1 to use the remaining transaction timeout,
+   *                   this is the recommended use.
+   *
+   * @remark It is strongly recommended to always pass -1 (remaining transaction
+   *         time) as the \p timeout_ms. Using other values risk internal
+   *         state desynchronization in case any of the underlying protocol
+   *         requests fail.
    *
    * @returns an RdKafka::Error object on error, or NULL on success.
    *          Check whether the returned error object permits retrying

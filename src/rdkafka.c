@@ -499,6 +499,8 @@ static const struct rd_kafka_err_desc rd_kafka_err_descs[] = {
                   "Local: Group partition assignment lost"),
         _ERR_DESC(RD_KAFKA_RESP_ERR__NOOP,
                   "Local: No operation performed"),
+        _ERR_DESC(RD_KAFKA_RESP_ERR__AUTO_OFFSET_RESET,
+                  "Local: No offset to automatically reset to"),
 
 	_ERR_DESC(RD_KAFKA_RESP_ERR_UNKNOWN,
 		  "Unknown broker error"),
@@ -687,7 +689,8 @@ static const struct rd_kafka_err_desc rd_kafka_err_descs[] = {
         _ERR_DESC(RD_KAFKA_RESP_ERR_NO_REASSIGNMENT_IN_PROGRESS,
                   "Broker: No partition reassignment is in progress"),
         _ERR_DESC(RD_KAFKA_RESP_ERR_GROUP_SUBSCRIBED_TO_TOPIC,
-                  "Broker: Deleting offsets of a topic while the consumer group is subscribed to it"),
+                  "Broker: Deleting offsets of a topic while the consumer "
+                  "group is subscribed to it"),
         _ERR_DESC(RD_KAFKA_RESP_ERR_INVALID_RECORD,
                   "Broker: Broker failed to validate record"),
         _ERR_DESC(RD_KAFKA_RESP_ERR_UNSTABLE_OFFSET_COMMIT,
@@ -4197,8 +4200,9 @@ rd_kafka_resp_err_t rd_kafka_flush (rd_kafka_t *rk, int timeout_ms) {
 
                 do {
                         rd_kafka_poll(rk, tmout);
-                } while (((qlen = rd_kafka_q_len(rk->rk_rep)) > 0 ||
-                          (msg_cnt = rd_kafka_curr_msgs_cnt(rk)) > 0) &&
+                        qlen = rd_kafka_q_len(rk->rk_rep);
+                        msg_cnt = rd_kafka_curr_msgs_cnt(rk);
+                } while (qlen + msg_cnt > 0 &&
                          !rd_kafka_yield_thread &&
                          (tmout = rd_timeout_remains_limit(ts_end, 10)) !=
                          RD_POLL_NOWAIT);
@@ -4609,7 +4613,7 @@ rd_kafka_list_groups (rd_kafka_t *rk, const char *group,
         /* Query each broker for its list of groups */
         TAILQ_FOREACH(rkb, &rk->rk_brokers, rkb_link) {
                 rd_kafka_broker_lock(rkb);
-                if (rkb->rkb_nodeid == -1) {
+                if (rkb->rkb_nodeid == -1 || RD_KAFKA_BROKER_IS_LOGICAL(rkb)) {
                         rd_kafka_broker_unlock(rkb);
                         continue;
                 }

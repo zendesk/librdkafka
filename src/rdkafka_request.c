@@ -649,7 +649,8 @@ rd_kafka_handle_OffsetFetch (rd_kafka_t *rk,
                              rd_kafka_buf_t *request,
                              rd_kafka_topic_partition_list_t **offsets,
                              rd_bool_t update_toppar,
-                             rd_bool_t add_part) {
+                             rd_bool_t add_part,
+                             rd_bool_t allow_retry) {
         const int log_decode_errors = LOG_ERR;
         int32_t TopicArrayCnt;
         int64_t offset = RD_KAFKA_OFFSET_INVALID;
@@ -805,7 +806,7 @@ rd_kafka_handle_OffsetFetch (rd_kafka_t *rk,
         }
 
         if (actions & RD_KAFKA_ERR_ACTION_RETRY || retry_unstable) {
-                if (rd_kafka_buf_retry(rkb, request))
+                if (allow_retry && rd_kafka_buf_retry(rkb, request))
                         return RD_KAFKA_RESP_ERR__IN_PROGRESS;
                 /* FALLTHRU */
         }
@@ -865,7 +866,11 @@ void rd_kafka_op_handle_OffsetFetch (rd_kafka_t *rk,
                 err = rd_kafka_handle_OffsetFetch(rkb->rkb_rk, rkb, err, rkbuf,
                                                   request, &offsets,
                                                   rd_false/*dont update rktp*/,
-                                                  rd_false/*dont add part*/);
+                                                  rd_false/*dont add part*/,
+                                                  /* Allow retries if replyq
+                                                   * is valid */
+                                                  rd_kafka_op_replyq_is_valid(
+                                                          rko));
                 if (err == RD_KAFKA_RESP_ERR__IN_PROGRESS) {
                         if (offsets)
                                 rd_kafka_topic_partition_list_destroy(offsets);
@@ -940,7 +945,7 @@ void rd_kafka_OffsetFetchRequest (rd_kafka_broker_t *rkb,
 
         if (ApiVersion >= 7) {
                 /* RequireStable */
-                rd_kafka_buf_write_i8(rkbuf, 0xaa); //require_stable);
+                rd_kafka_buf_write_i8(rkbuf, require_stable);
         }
 
         rd_kafka_buf_ApiVersion_set(rkbuf, ApiVersion, 0);
@@ -958,6 +963,9 @@ void rd_kafka_OffsetFetchRequest (rd_kafka_broker_t *rkb,
                 rd_kafka_buf_callback(rkb->rkb_rk, rkb, 0, NULL, rkbuf);
                 return;
         }
+
+        /* Let handler decide if retries should be performed */
+        rkbuf->rkbuf_max_retries = RD_KAFKA_REQUEST_MAX_RETRIES;
 
         rd_rkb_dbg(rkb, CGRP|RD_KAFKA_DBG_CONSUMER, "OFFSET",
                    "Fetch committed offsets for %d/%d partition(s)",
@@ -2782,7 +2790,12 @@ rd_kafka_handle_idempotent_Produce_error (rd_kafka_broker_t *rkb,
                 } else
 #endif
 
-                        if (!firstmsg->rkm_u.producer.retries &&
+                        /* Prior to supporting KIP-360 we treat these fatal
+                         * idempotent producer errors as fatal transactional
+                         * errors as well.
+                         * This is to maintain data integrity. */
+                        if (!rd_kafka_is_transactional(rk) &&
+                            !firstmsg->rkm_u.producer.retries &&
                            perr->next_err_seq == batch->first_seq) {
                         rd_rkb_dbg(rkb, MSG|RD_KAFKA_DBG_EOS, "UNKPID",
                                    "ProduceRequest for %.*s [%"PRId32"] "
@@ -2942,7 +2955,7 @@ static int rd_kafka_handle_Produce_error (rd_kafka_broker_t *rkb,
                 RD_KAFKA_RESP_ERR_DUPLICATE_SEQUENCE_NUMBER,
 
                 RD_KAFKA_ERR_ACTION_PERMANENT|
-                RD_KAFKA_ERR_ACTION_MSG_POSSIBLY_PERSISTED,
+                RD_KAFKA_ERR_ACTION_MSG_NOT_PERSISTED,
                 RD_KAFKA_RESP_ERR_UNKNOWN_PRODUCER_ID,
 
                 RD_KAFKA_ERR_ACTION_PERMANENT|
@@ -4473,12 +4486,11 @@ rd_kafka_EndTxnRequest (rd_kafka_broker_t *rkb,
 
         /* Committed */
         rd_kafka_buf_write_bool(rkbuf, committed);
-
+        rkbuf->rkbuf_u.EndTxn.commit = committed;
 
         rd_kafka_buf_ApiVersion_set(rkbuf, ApiVersion, 0);
 
-        /* Let the handler perform retries */
-        rkbuf->rkbuf_max_retries = RD_KAFKA_REQUEST_NO_RETRIES;
+        rkbuf->rkbuf_max_retries = RD_KAFKA_REQUEST_MAX_RETRIES;
 
         rd_kafka_broker_buf_enq_replyq(rkb, rkbuf, replyq, resp_cb, opaque);
 

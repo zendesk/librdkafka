@@ -31,6 +31,7 @@
 #include "rdkafka.h"
 
 #include "../src/rdkafka_proto.h"
+#include "../src/rdstring.h"
 #include "../src/rdunittest.h"
 
 #include <stdarg.h>
@@ -58,12 +59,70 @@ static int error_is_fatal_cb (rd_kafka_t *rk, rd_kafka_resp_err_t err,
 }
 
 
+static rd_kafka_resp_err_t (*on_response_received_cb) (rd_kafka_t *rk,
+                                                       int sockfd,
+                                                       const char *brokername,
+                                                       int32_t brokerid,
+                                                       int16_t ApiKey,
+                                                       int16_t ApiVersion,
+                                                       int32_t CorrId,
+                                                       size_t  size,
+                                                       int64_t rtt,
+                                                       rd_kafka_resp_err_t err,
+                                                       void *ic_opaque);
+
+/**
+ * @brief Simple on_response_received interceptor that simply calls the
+ *        sub-test's on_response_received_cb function, if set.
+ */
+static rd_kafka_resp_err_t
+on_response_received_trampoline (rd_kafka_t *rk,
+                                 int sockfd,
+                                 const char *brokername,
+                                 int32_t brokerid,
+                                 int16_t ApiKey,
+                                 int16_t ApiVersion,
+                                 int32_t CorrId,
+                                 size_t  size,
+                                 int64_t rtt,
+                                 rd_kafka_resp_err_t err,
+                                 void *ic_opaque) {
+        TEST_ASSERT(on_response_received_cb != NULL, "");
+        return on_response_received_cb(rk, sockfd, brokername, brokerid,
+                                       ApiKey, ApiVersion,
+                                       CorrId, size, rtt, err, ic_opaque);
+}
+
+
+/**
+ * @brief on_new interceptor to add an on_response_received interceptor.
+ */
+static rd_kafka_resp_err_t on_new_producer (rd_kafka_t *rk,
+                                            const rd_kafka_conf_t *conf,
+                                            void *ic_opaque,
+                                            char *errstr, size_t errstr_size) {
+        rd_kafka_resp_err_t err = RD_KAFKA_RESP_ERR_NO_ERROR;
+
+        if (on_response_received_cb)
+                err = rd_kafka_interceptor_add_on_response_received(
+                        rk, "on_response_received",
+                        on_response_received_trampoline, ic_opaque);
+
+        return err;
+}
+
 
 /**
  * @brief Create a transactional producer and a mock cluster.
  *
  * The var-arg list is a NULL-terminated list of
  * (const char *key, const char *value) config properties.
+ *
+ * Special keys:
+ *   "on_response_received", "" - enable the on_response_received_cb
+ *                                interceptor,
+ *                                which must be assigned prior to
+ *                                calling create_tnx_producer().
  */
 static rd_kafka_t *create_txn_producer (rd_kafka_mock_cluster_t **mclusterp,
                                         const char *transactional_id,
@@ -73,6 +132,7 @@ static rd_kafka_t *create_txn_producer (rd_kafka_mock_cluster_t **mclusterp,
         char numstr[8];
         va_list ap;
         const char *key;
+        rd_bool_t add_interceptors = rd_false;
 
         rd_snprintf(numstr, sizeof(numstr), "%d", broker_cnt);
 
@@ -87,9 +147,22 @@ static rd_kafka_t *create_txn_producer (rd_kafka_mock_cluster_t **mclusterp,
         test_curr->ignore_dr_err = rd_false;
 
         va_start(ap, broker_cnt);
-        while ((key = va_arg(ap, const char *)))
-                test_conf_set(conf, key, va_arg(ap, const char *));
+        while ((key = va_arg(ap, const char *))) {
+                if (!strcmp(key, "on_response_received")) {
+                        add_interceptors = rd_true;
+                        (void)va_arg(ap, const char *);
+                } else {
+                        test_conf_set(conf, key, va_arg(ap, const char *));
+                }
+        }
         va_end(ap);
+
+        /* Add an on_.. interceptors */
+        if (add_interceptors)
+                rd_kafka_conf_interceptor_add_on_new(
+                        conf,
+                        "on_new_producer",
+                        on_new_producer, NULL);
 
         rk = test_create_handle(RD_KAFKA_PRODUCER, conf);
 
@@ -109,7 +182,6 @@ static rd_kafka_t *create_txn_producer (rd_kafka_mock_cluster_t **mclusterp,
 static void do_test_txn_recoverable_errors (void) {
         rd_kafka_t *rk;
         rd_kafka_mock_cluster_t *mcluster;
-        rd_kafka_resp_err_t err;
         rd_kafka_topic_partition_list_t *offsets;
         rd_kafka_consumer_group_metadata_t *cgmetadata;
         const char *groupid = "myGroupId";
@@ -117,7 +189,9 @@ static void do_test_txn_recoverable_errors (void) {
 
         SUB_TEST_QUICK();
 
-        rk = create_txn_producer(&mcluster, txnid, 3, NULL);
+        rk = create_txn_producer(&mcluster, txnid, 3,
+                                 "batch.num.messages", "1",
+                                 NULL);
 
         /* Make sure transaction and group coordinators are different.
          * This verifies that AddOffsetsToTxnRequest isn't sent to the
@@ -146,23 +220,29 @@ static void do_test_txn_recoverable_errors (void) {
          */
         TEST_CALL_ERROR__(rd_kafka_begin_transaction(rk));
 
+
+        /* Produce a message without error first */
+        TEST_CALL_ERR__(rd_kafka_producev(rk,
+                                          RD_KAFKA_V_TOPIC("mytopic"),
+                                          RD_KAFKA_V_PARTITION(0),
+                                          RD_KAFKA_V_VALUE("hi", 2),
+                                          RD_KAFKA_V_END));
+
         /*
-         * Produce a message, let it first fail on a fatal idempotent error
-         * that is retryable by the transaction manager, then let it fail with
-         * a non-idempo/non-txn retryable error
+         * Produce a message, let it fail with a non-idempo/non-txn
+         * retryable error
          */
         rd_kafka_mock_push_request_errors(
                 mcluster,
                 RD_KAFKAP_Produce,
                 1,
-                RD_KAFKA_RESP_ERR_UNKNOWN_PRODUCER_ID,
                 RD_KAFKA_RESP_ERR_NOT_ENOUGH_REPLICAS);
 
-        err = rd_kafka_producev(rk,
-                                RD_KAFKA_V_TOPIC("mytopic"),
-                                RD_KAFKA_V_VALUE("hi", 2),
-                                RD_KAFKA_V_END);
-        TEST_ASSERT(!err, "produce failed: %s", rd_kafka_err2str(err));
+        TEST_CALL_ERR__(rd_kafka_producev(rk,
+                                          RD_KAFKA_V_TOPIC("mytopic"),
+                                          RD_KAFKA_V_PARTITION(0),
+                                          RD_KAFKA_V_VALUE("hi", 2),
+                                          RD_KAFKA_V_END));
 
         /* Make sure messages are produced */
         rd_kafka_flush(rk, -1);
@@ -213,6 +293,637 @@ static void do_test_txn_recoverable_errors (void) {
                 RD_KAFKA_RESP_ERR_COORDINATOR_LOAD_IN_PROGRESS);
 
         TEST_CALL_ERROR__(rd_kafka_commit_transaction(rk, 5000));
+
+        /* All done */
+
+        rd_kafka_destroy(rk);
+
+        SUB_TEST_PASS();
+}
+
+
+/**
+ * @brief Test that fatal idempotence errors triggers abortable transaction
+ *        errors and that the producer can recover.
+ *
+ * @remark Until KIP-360 is supported the idempotent fatal errors are also
+ *         transactional fatal errors; thus this test-case is modified not to
+ *         recover but instead raise a fatal error. Change it back to recovery
+ *         tests when KIP-360 support is done.
+ */
+static void do_test_txn_fatal_idempo_errors (void) {
+        rd_kafka_t *rk;
+        rd_kafka_mock_cluster_t *mcluster;
+        rd_kafka_error_t *error;
+        const char *txnid = "myTxnId";
+
+        SUB_TEST_QUICK();
+
+        rk = create_txn_producer(&mcluster, txnid, 3,
+                                 "batch.num.messages", "1",
+                                 NULL);
+
+        test_curr->ignore_dr_err = rd_true;
+        test_curr->is_fatal_cb = error_is_fatal_cb;
+        allowed_error = RD_KAFKA_RESP_ERR_UNKNOWN_PRODUCER_ID;
+
+        TEST_CALL_ERROR__(rd_kafka_init_transactions(rk, 5000));
+
+        /*
+         * Start a transaction
+         */
+        TEST_CALL_ERROR__(rd_kafka_begin_transaction(rk));
+
+
+        /* Produce a message without error first */
+        TEST_CALL_ERR__(rd_kafka_producev(rk,
+                                          RD_KAFKA_V_TOPIC("mytopic"),
+                                          RD_KAFKA_V_PARTITION(0),
+                                          RD_KAFKA_V_VALUE("hi", 2),
+                                          RD_KAFKA_V_END));
+
+        /* Produce a message, let it fail with a fatal idempo error. */
+        rd_kafka_mock_push_request_errors(
+                mcluster,
+                RD_KAFKAP_Produce,
+                1,
+                RD_KAFKA_RESP_ERR_UNKNOWN_PRODUCER_ID);
+
+        TEST_CALL_ERR__(rd_kafka_producev(rk,
+                                          RD_KAFKA_V_TOPIC("mytopic"),
+                                          RD_KAFKA_V_PARTITION(0),
+                                          RD_KAFKA_V_VALUE("hi", 2),
+                                          RD_KAFKA_V_END));
+
+        /* Commit the transaction, should fail */
+        error = rd_kafka_commit_transaction(rk, -1);
+        TEST_ASSERT(error != NULL, "Expected commit_transaction() to fail");
+
+        TEST_SAY("commit_transaction() failed (expectedly): %s\n",
+                 rd_kafka_error_string(error));
+
+        TEST_ASSERT(rd_kafka_error_is_fatal(error),
+                    "Expected fatal error (pre-KIP360)");
+        TEST_ASSERT(!rd_kafka_error_is_retriable(error),
+                    "Did not expect retriable error");
+        TEST_ASSERT(!rd_kafka_error_txn_requires_abort(error),
+                    "Did not expect txn_requires_abort");
+        rd_kafka_error_destroy(error);
+
+        goto prekip360_done;
+
+        /* Abort the transaction */
+        TEST_CALL_ERROR__(rd_kafka_abort_transaction(rk, -1));
+
+        /* Run a new transaction without errors to verify that the
+         * producer can recover. */
+        TEST_CALL_ERROR__(rd_kafka_begin_transaction(rk));
+
+        TEST_CALL_ERR__(rd_kafka_producev(rk,
+                                          RD_KAFKA_V_TOPIC("mytopic"),
+                                          RD_KAFKA_V_PARTITION(0),
+                                          RD_KAFKA_V_VALUE("hi", 2),
+                                          RD_KAFKA_V_END));
+
+        TEST_CALL_ERROR__(rd_kafka_commit_transaction(rk, -1));
+
+ prekip360_done:
+        /* All done */
+
+        rd_kafka_destroy(rk);
+
+        allowed_error = RD_KAFKA_RESP_ERR_NO_ERROR;
+
+        SUB_TEST_PASS();
+}
+
+
+/**
+ * @brief Test EndTxn errors.
+ */
+static void do_test_txn_endtxn_errors (void) {
+        rd_kafka_t *rk = NULL;
+        rd_kafka_mock_cluster_t *mcluster = NULL;
+        rd_kafka_resp_err_t err;
+        struct {
+                size_t error_cnt;
+                rd_kafka_resp_err_t errors[4];
+                rd_kafka_resp_err_t exp_err;
+                rd_bool_t exp_retriable;
+                rd_bool_t exp_abortable;
+                rd_bool_t exp_fatal;
+        } scenario[] = {
+                /* This list of errors is from the EndTxnResponse handler in
+                 * AK clients/.../TransactionManager.java */
+                { /* #0 */
+                        2,
+                        { RD_KAFKA_RESP_ERR_COORDINATOR_NOT_AVAILABLE,
+                          RD_KAFKA_RESP_ERR_COORDINATOR_NOT_AVAILABLE },
+                        /* Should auto-recover */
+                        RD_KAFKA_RESP_ERR_NO_ERROR,
+                },
+                { /* #1 */
+                        2,
+                        { RD_KAFKA_RESP_ERR_NOT_COORDINATOR,
+                          RD_KAFKA_RESP_ERR_NOT_COORDINATOR },
+                        /* Should auto-recover */
+                        RD_KAFKA_RESP_ERR_NO_ERROR,
+                },
+                { /* #2 */
+                        1,
+                        { RD_KAFKA_RESP_ERR_COORDINATOR_LOAD_IN_PROGRESS },
+                        /* Should auto-recover */
+                        RD_KAFKA_RESP_ERR_NO_ERROR,
+                },
+                { /* #3 */
+                        3,
+                        { RD_KAFKA_RESP_ERR_CONCURRENT_TRANSACTIONS,
+                          RD_KAFKA_RESP_ERR_CONCURRENT_TRANSACTIONS,
+                          RD_KAFKA_RESP_ERR_CONCURRENT_TRANSACTIONS },
+                        /* Should auto-recover */
+                        RD_KAFKA_RESP_ERR_NO_ERROR,
+                },
+                { /* #4 */
+                        1,
+                        { RD_KAFKA_RESP_ERR_UNKNOWN_PRODUCER_ID },
+                        RD_KAFKA_RESP_ERR_UNKNOWN_PRODUCER_ID,
+                        rd_false /* !retriable */,
+                        rd_true /* abortable */,
+                        rd_false /* !fatal */
+                },
+                { /* #5 */
+                        1,
+                        { RD_KAFKA_RESP_ERR_INVALID_PRODUCER_ID_MAPPING },
+                        RD_KAFKA_RESP_ERR_INVALID_PRODUCER_ID_MAPPING,
+                        rd_false /* !retriable */,
+                        rd_true /* abortable */,
+                        rd_false /* !fatal */
+                },
+                { /* #6 */
+                        1,
+                        { RD_KAFKA_RESP_ERR_INVALID_PRODUCER_EPOCH },
+                        /* This error is normalized */
+                        RD_KAFKA_RESP_ERR__FENCED,
+                        rd_false /* !retriable */,
+                        rd_false /* !abortable */,
+                        rd_true /* fatal */
+                },
+                { /* #7 */
+                        1,
+                        { RD_KAFKA_RESP_ERR_PRODUCER_FENCED },
+                        /* This error is normalized */
+                        RD_KAFKA_RESP_ERR__FENCED,
+                        rd_false /* !retriable */,
+                        rd_false /* !abortable */,
+                        rd_true /* fatal */
+                },
+                { /* #8 */
+                        1,
+                        { RD_KAFKA_RESP_ERR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED },
+                        RD_KAFKA_RESP_ERR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED,
+                        rd_false /* !retriable */,
+                        rd_false /* !abortable */,
+                        rd_true /* fatal */
+                },
+                { /* #9 */
+                        1,
+                        { RD_KAFKA_RESP_ERR_GROUP_AUTHORIZATION_FAILED },
+                        RD_KAFKA_RESP_ERR_GROUP_AUTHORIZATION_FAILED,
+                        rd_false /* !retriable */,
+                        rd_true /* abortable */,
+                        rd_false /* !fatal */
+                },
+                { /* #10 */
+                        /* Any other error should raise a fatal error */
+                        1,
+                        { RD_KAFKA_RESP_ERR_INVALID_MSG_SIZE },
+                        RD_KAFKA_RESP_ERR_INVALID_MSG_SIZE,
+                        rd_false /* !retriable */,
+                        rd_true /* abortable */,
+                        rd_false /* !fatal */,
+                },
+                { 0 },
+        };
+        int i;
+
+        SUB_TEST_QUICK();
+
+        for (i = 0 ; scenario[i].error_cnt > 0 ; i++) {
+                int j;
+                /* For each scenario, test:
+                 *   commit_transaction()
+                 *   flush() + commit_transaction()
+                 *   abort_transaction()
+                 *   flush() + abort_transaction()
+                 */
+                for (j = 0 ; j < (2+2) ; j++) {
+                        rd_bool_t commit = j < 2;
+                        rd_bool_t with_flush = j & 1;
+                        const char *commit_str =
+                                commit ?
+                                (with_flush ? "commit&flush" : "commit") :
+                                (with_flush ? "abort&flush" : "abort");
+                        rd_kafka_topic_partition_list_t *offsets;
+                        rd_kafka_consumer_group_metadata_t *cgmetadata;
+                        rd_kafka_error_t *error;
+
+                        TEST_SAY("Testing scenario #%d %s with %"PRIusz
+                                 " injected erorrs, expecting %s\n",
+                                 i, commit_str,
+                                 scenario[i].error_cnt,
+                                 rd_kafka_err2name(scenario[i].exp_err));
+
+                        if (!rk) {
+                                const char *txnid = "myTxnId";
+                                rk = create_txn_producer(&mcluster, txnid,
+                                                         3, NULL);
+                                TEST_CALL_ERROR__(rd_kafka_init_transactions(
+                                                          rk, 5000));
+                        }
+
+                        /*
+                         * Start transaction
+                         */
+                        TEST_CALL_ERROR__(rd_kafka_begin_transaction(rk));
+
+                        /* Transaction aborts will cause DR errors:
+                         * ignore them. */
+                        test_curr->ignore_dr_err = !commit;
+
+                        /*
+                         * Produce a message.
+                         */
+                        err = rd_kafka_producev(rk,
+                                                RD_KAFKA_V_TOPIC("mytopic"),
+                                                RD_KAFKA_V_VALUE("hi", 2),
+                                                RD_KAFKA_V_END);
+                        TEST_ASSERT(!err, "produce failed: %s",
+                                    rd_kafka_err2str(err));
+
+                        if (with_flush)
+                                test_flush(rk, -1);
+
+                        /*
+                         * Send some arbitrary offsets.
+                         */
+                        offsets = rd_kafka_topic_partition_list_new(4);
+                        rd_kafka_topic_partition_list_add(offsets, "srctopic",
+                                                          3)->offset = 12;
+                        rd_kafka_topic_partition_list_add(offsets, "srctop2",
+                                                          99)->offset = 99999;
+
+                        cgmetadata = rd_kafka_consumer_group_metadata_new(
+                                "mygroupid");
+
+                        TEST_CALL_ERROR__(rd_kafka_send_offsets_to_transaction(
+                                                  rk, offsets,
+                                                  cgmetadata, -1));
+
+                        rd_kafka_consumer_group_metadata_destroy(cgmetadata);
+                        rd_kafka_topic_partition_list_destroy(offsets);
+
+                        /*
+                         * Commit transaction, first with som failures,
+                         * then succeed.
+                         */
+                        rd_kafka_mock_push_request_errors_array(
+                                mcluster,
+                                RD_KAFKAP_EndTxn,
+                                scenario[i].error_cnt,
+                                scenario[i].errors);
+
+                        if (commit)
+                                error = rd_kafka_commit_transaction(rk, 5000);
+                        else
+                                error = rd_kafka_abort_transaction(rk, 5000);
+
+                        if (error)
+                                TEST_SAY("Scenario #%d %s failed: %s: %s "
+                                         "(retriable=%s, req_abort=%s, "
+                                         "fatal=%s)\n",
+                                         i, commit_str,
+                                         rd_kafka_error_name(error),
+                                         rd_kafka_error_string(error),
+                                         RD_STR_ToF(rd_kafka_error_is_retriable(error)),
+                                         RD_STR_ToF(rd_kafka_error_txn_requires_abort(error)),
+                                         RD_STR_ToF(rd_kafka_error_is_fatal(error)));
+                        else
+                                TEST_SAY("Scenario #%d %s succeeded\n",
+                                         i, commit_str);
+
+                        if (!scenario[i].exp_err) {
+                                TEST_ASSERT(!error,
+                                            "Expected #%d %s to succeed, "
+                                            "got %s",
+                                            i, commit_str,
+                                            rd_kafka_error_string(error));
+                                continue;
+                        }
+
+
+                        TEST_ASSERT(error != NULL,
+                                    "Expected #%d %s to fail",
+                                    i, commit_str);
+                        TEST_ASSERT(scenario[i].exp_err ==
+                                    rd_kafka_error_code(error),
+                                    "Scenario #%d: expected %s, not %s",
+                                    i,
+                                    rd_kafka_err2name(scenario[i].exp_err),
+                                    rd_kafka_error_name(error));
+                        TEST_ASSERT(scenario[i].exp_retriable ==
+                                    (rd_bool_t)
+                                    rd_kafka_error_is_retriable(error),
+                                    "Scenario #%d: retriable mismatch",
+                                    i);
+                        TEST_ASSERT(scenario[i].exp_abortable ==
+                                    (rd_bool_t)
+                                    rd_kafka_error_txn_requires_abort(error),
+                                    "Scenario #%d: abortable mismatch",
+                                    i);
+                        TEST_ASSERT(scenario[i].exp_fatal ==
+                                    (rd_bool_t)rd_kafka_error_is_fatal(error),
+                                    "Scenario #%d: fatal mismatch", i);
+
+                        /* Handle errors according to the error flags */
+                        if (rd_kafka_error_is_fatal(error)) {
+                                TEST_SAY("Fatal error, destroying producer\n");
+                                rd_kafka_error_destroy(error);
+                                rd_kafka_destroy(rk);
+                                rk = NULL; /* Will be re-created on the next
+                                            * loop iteration. */
+
+                        } else if (rd_kafka_error_txn_requires_abort(error)) {
+                                rd_kafka_error_destroy(error);
+                                TEST_SAY("Abortable error, "
+                                         "aborting transaction\n");
+                                TEST_CALL_ERROR__(
+                                        rd_kafka_abort_transaction(rk, -1));
+
+                        } else if (rd_kafka_error_is_retriable(error)) {
+                                rd_kafka_error_destroy(error);
+                                TEST_SAY("Retriable error, retrying %s once\n",
+                                         commit_str);
+                                if (commit)
+                                        TEST_CALL_ERROR__(
+                                                rd_kafka_commit_transaction(
+                                                        rk, 5000));
+                                else
+                                        TEST_CALL_ERROR__(
+                                                rd_kafka_abort_transaction(
+                                                        rk, 5000));
+                        } else {
+                                TEST_FAIL("Scenario #%d %s: "
+                                          "Permanent error without enough "
+                                          "hints to proceed: %s\n",
+                                          i, commit_str,
+                                          rd_kafka_error_string(error));
+                        }
+                }
+        }
+
+        /* All done */
+        if (rk)
+                rd_kafka_destroy(rk);
+
+        SUB_TEST_PASS();
+}
+
+
+/**
+ * @brief Test that the commit/abort works properly with infinite timeout.
+ */
+static void do_test_txn_endtxn_infinite (void) {
+        rd_kafka_t *rk;
+        rd_kafka_mock_cluster_t *mcluster = NULL;
+        const char *txnid = "myTxnId";
+        int i;
+
+        SUB_TEST_QUICK();
+
+        rk = create_txn_producer(&mcluster, txnid, 3, NULL);
+
+        TEST_CALL_ERROR__(rd_kafka_init_transactions(rk, 5000));
+
+        for (i = 0 ; i < 2 ; i++) {
+                rd_bool_t commit = i == 0;
+                const char *commit_str = commit ? "commit" : "abort";
+                rd_kafka_error_t *error;
+                test_timing_t t_call;
+
+                /* Messages will fail on as the transaction fails,
+                 * ignore the DR error */
+                test_curr->ignore_dr_err = rd_true;
+
+                TEST_CALL_ERROR__(rd_kafka_begin_transaction(rk));
+
+                TEST_CALL_ERR__(rd_kafka_producev(rk,
+                                                  RD_KAFKA_V_TOPIC("mytopic"),
+                                                  RD_KAFKA_V_VALUE("hi", 2),
+                                                  RD_KAFKA_V_END));
+
+                /*
+                 * Commit/abort transaction, first with som retriable failures,
+                 * then success.
+                 */
+                rd_kafka_mock_push_request_errors(
+                        mcluster,
+                        RD_KAFKAP_EndTxn,
+                        10,
+                        RD_KAFKA_RESP_ERR_COORDINATOR_NOT_AVAILABLE,
+                        RD_KAFKA_RESP_ERR_NOT_COORDINATOR,
+                        RD_KAFKA_RESP_ERR_NOT_COORDINATOR,
+                        RD_KAFKA_RESP_ERR_NOT_COORDINATOR,
+                        RD_KAFKA_RESP_ERR_NOT_COORDINATOR,
+                        RD_KAFKA_RESP_ERR_NOT_COORDINATOR,
+                        RD_KAFKA_RESP_ERR_NOT_COORDINATOR,
+                        RD_KAFKA_RESP_ERR_COORDINATOR_LOAD_IN_PROGRESS,
+                        RD_KAFKA_RESP_ERR_NOT_COORDINATOR,
+                        RD_KAFKA_RESP_ERR_NOT_COORDINATOR);
+
+                rd_sleep(1);
+
+                TIMING_START(&t_call, "%s_transaction()", commit_str);
+                if (commit)
+                        error = rd_kafka_commit_transaction(rk, -1);
+                else
+                        error = rd_kafka_abort_transaction(rk, -1);
+                TIMING_STOP(&t_call);
+
+                TEST_SAY("%s returned %s\n",
+                         commit_str,
+                         error ? rd_kafka_error_string(error) : "success");
+
+                TEST_ASSERT(!error,
+                            "Expected %s to succeed, got %s",
+                            commit_str, rd_kafka_error_string(error));
+
+        }
+
+        /* All done */
+
+        rd_kafka_destroy(rk);
+
+        SUB_TEST_PASS();
+}
+
+
+
+/**
+ * @brief Test that the commit/abort user timeout is honoured.
+ */
+static void do_test_txn_endtxn_timeout (void) {
+        rd_kafka_t *rk;
+        rd_kafka_mock_cluster_t *mcluster = NULL;
+        const char *txnid = "myTxnId";
+        int i;
+
+        SUB_TEST_QUICK();
+
+        rk = create_txn_producer(&mcluster, txnid, 3, NULL);
+
+        TEST_CALL_ERROR__(rd_kafka_init_transactions(rk, 5000));
+
+        for (i = 0 ; i < 2 ; i++) {
+                rd_bool_t commit = i == 0;
+                const char *commit_str = commit ? "commit" : "abort";
+                rd_kafka_error_t *error;
+                test_timing_t t_call;
+
+                /* Messages will fail on as the transaction fails,
+                 * ignore the DR error */
+                test_curr->ignore_dr_err = rd_true;
+
+                TEST_CALL_ERROR__(rd_kafka_begin_transaction(rk));
+
+                TEST_CALL_ERR__(rd_kafka_producev(rk,
+                                                  RD_KAFKA_V_TOPIC("mytopic"),
+                                                  RD_KAFKA_V_VALUE("hi", 2),
+                                                  RD_KAFKA_V_END));
+
+                /*
+                 * Commit/abort transaction, first with som retriable failures
+                 * whos retries exceed the user timeout.
+                 */
+                rd_kafka_mock_push_request_errors(
+                        mcluster,
+                        RD_KAFKAP_EndTxn,
+                        10,
+                        RD_KAFKA_RESP_ERR_COORDINATOR_NOT_AVAILABLE,
+                        RD_KAFKA_RESP_ERR_NOT_COORDINATOR,
+                        RD_KAFKA_RESP_ERR_NOT_COORDINATOR,
+                        RD_KAFKA_RESP_ERR_NOT_COORDINATOR,
+                        RD_KAFKA_RESP_ERR_NOT_COORDINATOR,
+                        RD_KAFKA_RESP_ERR_NOT_COORDINATOR,
+                        RD_KAFKA_RESP_ERR_NOT_COORDINATOR,
+                        RD_KAFKA_RESP_ERR_COORDINATOR_LOAD_IN_PROGRESS,
+                        RD_KAFKA_RESP_ERR_NOT_COORDINATOR,
+                        RD_KAFKA_RESP_ERR_NOT_COORDINATOR);
+
+                rd_sleep(1);
+
+                TIMING_START(&t_call, "%s_transaction()", commit_str);
+                if (commit)
+                        error = rd_kafka_commit_transaction(rk, 100);
+                else
+                        error = rd_kafka_abort_transaction(rk, 100);
+                TIMING_STOP(&t_call);
+
+                TEST_SAY("%s returned %s\n",
+                         commit_str,
+                         error ? rd_kafka_error_string(error) : "success");
+
+                TEST_ASSERT(error != NULL,
+                            "Expected %s to fail", commit_str);
+
+                TEST_ASSERT(rd_kafka_error_code(error) ==
+                            RD_KAFKA_RESP_ERR__TIMED_OUT,
+                            "Expected %s to fail with timeout, not %s: %s",
+                            commit_str,
+                            rd_kafka_error_name(error),
+                            rd_kafka_error_string(error));
+
+                if (!commit)
+                        TEST_ASSERT(!rd_kafka_error_txn_requires_abort(error),
+                                    "abort_transaction() failure should raise "
+                                    "a txn_requires_abort error");
+                else {
+                        TEST_ASSERT(rd_kafka_error_txn_requires_abort(error),
+                                    "commit_transaction() failure should raise "
+                                    "a txn_requires_abort error");
+                        TEST_SAY("Aborting transaction as instructed by "
+                                 "error flag\n");
+                        TEST_CALL_ERROR__(rd_kafka_abort_transaction(rk, -1));
+                }
+
+                rd_kafka_error_destroy(error);
+
+                TIMING_ASSERT(&t_call, 99, 199);
+        }
+
+        /* All done */
+
+        rd_kafka_destroy(rk);
+
+        SUB_TEST_PASS();
+}
+
+
+/**
+ * @brief Test that EndTxn is properly sent for aborted transactions
+ *        even if AddOffsetsToTxnRequest was retried.
+ *        This is a check for a txn_req_cnt bug.
+ */
+static void do_test_txn_req_cnt (void) {
+        rd_kafka_t *rk;
+        rd_kafka_mock_cluster_t *mcluster;
+        rd_kafka_topic_partition_list_t *offsets;
+        rd_kafka_consumer_group_metadata_t *cgmetadata;
+        const char *txnid = "myTxnId";
+
+        SUB_TEST_QUICK();
+
+        rk = create_txn_producer(&mcluster, txnid, 3, NULL);
+
+        /* Messages will fail on abort(), ignore the DR error */
+        test_curr->ignore_dr_err = rd_true;
+
+        TEST_CALL_ERROR__(rd_kafka_init_transactions(rk, 5000));
+
+        TEST_CALL_ERROR__(rd_kafka_begin_transaction(rk));
+
+        /*
+         * Send some arbitrary offsets, first with some failures, then
+         * succeed.
+         */
+        offsets = rd_kafka_topic_partition_list_new(2);
+        rd_kafka_topic_partition_list_add(offsets, "srctopic", 3)->offset = 12;
+        rd_kafka_topic_partition_list_add(offsets, "srctop2", 99)->offset =
+                999999111;
+
+        rd_kafka_mock_push_request_errors(
+                mcluster,
+                RD_KAFKAP_AddOffsetsToTxn,
+                2,
+                RD_KAFKA_RESP_ERR_REQUEST_TIMED_OUT,
+                RD_KAFKA_RESP_ERR_NOT_COORDINATOR);
+
+        rd_kafka_mock_push_request_errors(
+                mcluster,
+                RD_KAFKAP_TxnOffsetCommit,
+                2,
+                RD_KAFKA_RESP_ERR_COORDINATOR_LOAD_IN_PROGRESS,
+                RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_OR_PART);
+
+        cgmetadata = rd_kafka_consumer_group_metadata_new("mygroupid");
+
+        TEST_CALL_ERROR__(rd_kafka_send_offsets_to_transaction(
+                                  rk, offsets,
+                                  cgmetadata, -1));
+
+        rd_kafka_consumer_group_metadata_destroy(cgmetadata);
+        rd_kafka_topic_partition_list_destroy(offsets);
+
+        TEST_CALL_ERROR__(rd_kafka_abort_transaction(rk, 5000));
 
         /* All done */
 
@@ -946,6 +1657,593 @@ static void do_test_txn_flush_timeout (void) {
 }
 
 
+/**
+ * @brief ESC-4424: rko is reused in response handler after destroy in coord_req
+ *        sender due to bad state.
+ *
+ * This is somewhat of a race condition so we need to perform a couple of
+ * iterations before it hits, usually 2 or 3, so we try at least 15 times.
+ */
+static void do_test_txn_coord_req_destroy (void) {
+        rd_kafka_t *rk;
+        rd_kafka_mock_cluster_t *mcluster;
+        int i;
+        int errcnt = 0;
+
+        SUB_TEST();
+
+        rk = create_txn_producer(&mcluster, "txnid", 3, NULL);
+
+        test_curr->ignore_dr_err = rd_true;
+
+        TEST_CALL_ERROR__(rd_kafka_init_transactions(rk, 5000));
+
+        for (i = 0 ; i < 15 ; i++) {
+                rd_kafka_error_t *error;
+                rd_kafka_resp_err_t err;
+                rd_kafka_topic_partition_list_t *offsets;
+                rd_kafka_consumer_group_metadata_t *cgmetadata;
+
+                test_timeout_set(10);
+
+                TEST_CALL_ERROR__(rd_kafka_begin_transaction(rk));
+
+                /*
+                 * Inject errors to trigger retries
+                 */
+                rd_kafka_mock_push_request_errors(
+                        mcluster,
+                        RD_KAFKAP_AddPartitionsToTxn,
+                        2,/* first request + number of internal retries */
+                        RD_KAFKA_RESP_ERR_CONCURRENT_TRANSACTIONS,
+                        RD_KAFKA_RESP_ERR_CONCURRENT_TRANSACTIONS);
+
+                rd_kafka_mock_push_request_errors(
+                        mcluster,
+                        RD_KAFKAP_AddOffsetsToTxn,
+                        1,/* first request + number of internal retries */
+                        RD_KAFKA_RESP_ERR_CONCURRENT_TRANSACTIONS);
+
+                err = rd_kafka_producev(rk,
+                                        RD_KAFKA_V_TOPIC("mytopic"),
+                                        RD_KAFKA_V_VALUE("hi", 2),
+                                        RD_KAFKA_V_END);
+                TEST_ASSERT(!err, "produce failed: %s", rd_kafka_err2str(err));
+
+                rd_kafka_mock_push_request_errors(
+                        mcluster,
+                        RD_KAFKAP_Produce,
+                        4,
+                        RD_KAFKA_RESP_ERR_REQUEST_TIMED_OUT,
+                        RD_KAFKA_RESP_ERR_REQUEST_TIMED_OUT,
+                        RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED,
+                        RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED);
+                /* FIXME: When KIP-360 is supported, add this error:
+                 *        RD_KAFKA_RESP_ERR_OUT_OF_ORDER_SEQUENCE_NUMBER */
+
+                err = rd_kafka_producev(rk,
+                                        RD_KAFKA_V_TOPIC("mytopic"),
+                                        RD_KAFKA_V_VALUE("hi", 2),
+                                        RD_KAFKA_V_END);
+                TEST_ASSERT(!err, "produce failed: %s", rd_kafka_err2str(err));
+
+
+                /*
+                 * Send offsets to transaction
+                 */
+
+                offsets = rd_kafka_topic_partition_list_new(1);
+                rd_kafka_topic_partition_list_add(offsets, "srctopic", 3)->
+                        offset = 12;
+
+                cgmetadata = rd_kafka_consumer_group_metadata_new("mygroupid");
+
+                error = rd_kafka_send_offsets_to_transaction(rk, offsets,
+                                                             cgmetadata, -1);
+
+                TEST_SAY("send_offsets_to_transaction() #%d: %s\n",
+                         i, rd_kafka_error_string(error));
+
+                /* As we can't control the exact timing and sequence
+                 * of requests this sometimes fails and sometimes succeeds,
+                 * but we run the test enough times to trigger at least
+                 * one failure. */
+                if (error) {
+                        TEST_SAY("send_offsets_to_transaction() #%d "
+                                 "failed (expectedly): %s\n",
+                                 i, rd_kafka_error_string(error));
+                        TEST_ASSERT(rd_kafka_error_txn_requires_abort(error),
+                                    "Expected abortable error for #%d", i);
+                        rd_kafka_error_destroy(error);
+                        errcnt++;
+                }
+
+                rd_kafka_consumer_group_metadata_destroy(cgmetadata);
+                rd_kafka_topic_partition_list_destroy(offsets);
+
+                /* Allow time for internal retries */
+                rd_sleep(2);
+
+                TEST_CALL_ERROR__(rd_kafka_abort_transaction(rk, 5000));
+        }
+
+        TEST_ASSERT(errcnt > 0,
+                    "Expected at least one send_offets_to_transaction() "
+                    "failure");
+
+        /* All done */
+
+        rd_kafka_destroy(rk);
+}
+
+
+static rd_atomic32_t multi_find_req_cnt;
+
+static rd_kafka_resp_err_t
+multi_find_on_response_received_cb (rd_kafka_t *rk,
+                                    int sockfd,
+                                    const char *brokername,
+                                    int32_t brokerid,
+                                    int16_t ApiKey,
+                                    int16_t ApiVersion,
+                                    int32_t CorrId,
+                                    size_t  size,
+                                    int64_t rtt,
+                                    rd_kafka_resp_err_t err,
+                                    void *ic_opaque) {
+        rd_kafka_mock_cluster_t *mcluster = rd_kafka_handle_mock_cluster(rk);
+        rd_bool_t done = rd_atomic32_get(&multi_find_req_cnt) > 10000;
+
+        if (ApiKey != RD_KAFKAP_AddOffsetsToTxn || done)
+                return RD_KAFKA_RESP_ERR_NO_ERROR;
+
+        TEST_SAY("on_response_received_cb: %s: %s: brokerid %"PRId32
+                 ", ApiKey %hd, CorrId %d, rtt %.2fms, %s: %s\n",
+                 rd_kafka_name(rk), brokername, brokerid, ApiKey, CorrId,
+                 rtt != -1 ? (float)rtt / 1000.0 : 0.0,
+                 done ? "already done" : "not done yet",
+                 rd_kafka_err2name(err));
+
+
+        if (rd_atomic32_add(&multi_find_req_cnt, 1) == 1) {
+                /* Trigger a broker down/up event, which in turns
+                 * triggers the coord_req_fsm(). */
+                rd_kafka_mock_broker_set_down(mcluster, 2);
+                rd_kafka_mock_broker_set_up(mcluster, 2);
+                return RD_KAFKA_RESP_ERR_NO_ERROR;
+        }
+
+        /* Trigger a broker down/up event, which in turns
+         * triggers the coord_req_fsm(). */
+        rd_kafka_mock_broker_set_down(mcluster, 3);
+        rd_kafka_mock_broker_set_up(mcluster, 3);
+
+        /* Clear the downed broker's latency so that it reconnects
+         * quickly, otherwise the ApiVersionRequest will be delayed and
+         * this will in turn delay the -> UP transition that we need to
+         * trigger the coord_reqs. */
+        rd_kafka_mock_broker_set_rtt(mcluster, 3, 0);
+
+        /* Only do this down/up once */
+        rd_atomic32_add(&multi_find_req_cnt, 10000);
+
+        return RD_KAFKA_RESP_ERR_NO_ERROR;
+}
+
+
+/**
+ * @brief ESC-4444: multiple FindCoordinatorRequests are sent referencing
+ *        the same coord_req_t, but the first one received will destroy
+ *        the coord_req_t object and make the subsequent FindCoordingResponses
+ *        reference a freed object.
+ *
+ * What we want to achieve is this sequence:
+ *  1. AddOffsetsToTxnRequest + Response which..
+ *  2. Triggers TxnOffsetCommitRequest, but the coordinator is not known, so..
+ *  3. Triggers a FindCoordinatorRequest
+ *  4. FindCoordinatorResponse from 3 is received ..
+ *  5. A TxnOffsetCommitRequest is sent from coord_req_fsm().
+ *  6. Another broker changing state to Up triggers coord reqs again, which..
+ *  7. Triggers a second TxnOffsetCommitRequest from coord_req_fsm().
+ *  7. FindCoordinatorResponse from 5 is received, references the destroyed rko
+ *     and crashes.
+ */
+static void do_test_txn_coord_req_multi_find (void) {
+        rd_kafka_t *rk;
+        rd_kafka_mock_cluster_t *mcluster;
+        rd_kafka_error_t *error;
+        rd_kafka_resp_err_t err;
+        rd_kafka_topic_partition_list_t *offsets;
+        rd_kafka_consumer_group_metadata_t *cgmetadata;
+        const char *txnid = "txnid", *groupid = "mygroupid", *topic = "mytopic";
+        int i;
+
+        SUB_TEST();
+
+        rd_atomic32_init(&multi_find_req_cnt, 0);
+
+        on_response_received_cb = multi_find_on_response_received_cb;
+        rk = create_txn_producer(&mcluster, txnid, 3,
+                                 /* Need connections to all brokers so we
+                                  * can trigger coord_req_fsm events
+                                  * by toggling connections. */
+                                 "enable.sparse.connections", "false",
+                                 /* Set up on_response_received interceptor */
+                                 "on_response_received", "", NULL);
+
+        /* Let broker 1 be both txn and group coordinator
+         * so that the group coordinator connection is up when it is time
+         * send the TxnOffsetCommitRequest. */
+        rd_kafka_mock_coordinator_set(mcluster, "transaction", txnid, 1);
+        rd_kafka_mock_coordinator_set(mcluster, "group", groupid, 1);
+
+        /* Set broker 1, 2, and 3 as leaders for a partition each and
+         * later produce to both partitions so we know there's a connection
+         * to all brokers. */
+        rd_kafka_mock_topic_create(mcluster, topic, 3, 1);
+        rd_kafka_mock_partition_set_leader(mcluster, topic, 0, 1);
+        rd_kafka_mock_partition_set_leader(mcluster, topic, 1, 2);
+        rd_kafka_mock_partition_set_leader(mcluster, topic, 2, 3);
+
+        /* Broker down is not a test-failing error */
+        allowed_error = RD_KAFKA_RESP_ERR__TRANSPORT;
+        test_curr->is_fatal_cb = error_is_fatal_cb;
+
+        TEST_CALL_ERROR__(rd_kafka_init_transactions(rk, 5000));
+
+        TEST_CALL_ERROR__(rd_kafka_begin_transaction(rk));
+
+        for (i = 0 ; i < 3 ; i++) {
+                err = rd_kafka_producev(rk,
+                                        RD_KAFKA_V_TOPIC(topic),
+                                        RD_KAFKA_V_PARTITION(i),
+                                        RD_KAFKA_V_VALUE("hi", 2),
+                                        RD_KAFKA_V_END);
+                TEST_ASSERT(!err, "produce failed: %s", rd_kafka_err2str(err));
+        }
+
+        test_flush(rk, 5000);
+
+        /*
+         * send_offsets_to_transaction() will query for the group coordinator,
+         * we need to make those requests slow so that multiple requests are
+         * sent.
+         */
+        for (i = 1 ; i <= 3 ; i++)
+                rd_kafka_mock_broker_set_rtt(mcluster, (int32_t)i, 4000);
+
+        /*
+         * Send offsets to transaction
+         */
+
+        offsets = rd_kafka_topic_partition_list_new(1);
+        rd_kafka_topic_partition_list_add(offsets, "srctopic", 3)->
+                offset = 12;
+
+        cgmetadata = rd_kafka_consumer_group_metadata_new(groupid);
+
+        error = rd_kafka_send_offsets_to_transaction(rk, offsets,
+                                                     cgmetadata, -1);
+
+        TEST_SAY("send_offsets_to_transaction() %s\n",
+                 rd_kafka_error_string(error));
+        TEST_ASSERT(!error, "send_offsets_to_transaction() failed: %s",
+                    rd_kafka_error_string(error));
+
+        rd_kafka_consumer_group_metadata_destroy(cgmetadata);
+        rd_kafka_topic_partition_list_destroy(offsets);
+
+        /* Clear delay */
+        for (i = 1 ; i <= 3 ; i++)
+                rd_kafka_mock_broker_set_rtt(mcluster, (int32_t)i, 0);
+
+        rd_sleep(5);
+
+        TEST_CALL_ERROR__(rd_kafka_commit_transaction(rk, 5000));
+
+        /* All done */
+
+        TEST_ASSERT(rd_atomic32_get(&multi_find_req_cnt) > 10000,
+                    "on_request_sent interceptor did not trigger properly");
+
+        rd_kafka_destroy(rk);
+
+        on_response_received_cb = NULL;
+
+        SUB_TEST_PASS();
+}
+
+
+/**
+ * @brief ESC-4410: adding producer partitions gradually will trigger multiple
+ *        AddPartitionsToTxn requests. Due to a bug the third partition to be
+ *        registered would hang in PEND_TXN state.
+ *
+ * Trigger this behaviour by having two outstanding AddPartitionsToTxn requests
+ * at the same time, followed by a need for a third:
+ *
+ * 1. Set coordinator broker rtt high (to give us time to produce).
+ * 2. Produce to partition 0, will trigger first AddPartitionsToTxn.
+ * 3. Produce to partition 1, will trigger second AddPartitionsToTxn.
+ * 4. Wait for second AddPartitionsToTxn response.
+ * 5. Produce to partition 2, should trigger AddPartitionsToTxn, but bug
+ *    causes it to be stale in pending state.
+ */
+
+static rd_atomic32_t multi_addparts_resp_cnt;
+static rd_kafka_resp_err_t
+multi_addparts_response_received_cb (rd_kafka_t *rk,
+                                     int sockfd,
+                                     const char *brokername,
+                                     int32_t brokerid,
+                                     int16_t ApiKey,
+                                     int16_t ApiVersion,
+                                     int32_t CorrId,
+                                     size_t  size,
+                                     int64_t rtt,
+                                     rd_kafka_resp_err_t err,
+                                     void *ic_opaque) {
+
+        if (ApiKey == RD_KAFKAP_AddPartitionsToTxn) {
+                TEST_SAY("on_response_received_cb: %s: %s: brokerid %"PRId32
+                         ", ApiKey %hd, CorrId %d, rtt %.2fms, count %"PRId32
+                         ": %s\n",
+                         rd_kafka_name(rk), brokername, brokerid,
+                         ApiKey, CorrId,
+                         rtt != -1 ? (float)rtt / 1000.0 : 0.0,
+                         rd_atomic32_get(&multi_addparts_resp_cnt),
+                         rd_kafka_err2name(err));
+
+                rd_atomic32_add(&multi_addparts_resp_cnt, 1);
+        }
+
+        return RD_KAFKA_RESP_ERR_NO_ERROR;
+}
+
+
+static void do_test_txn_addparts_req_multi (void) {
+        rd_kafka_t *rk;
+        rd_kafka_mock_cluster_t *mcluster;
+        const char *txnid = "txnid", *topic = "mytopic";
+        int32_t txn_coord = 2;
+
+        SUB_TEST();
+
+        rd_atomic32_init(&multi_addparts_resp_cnt, 0);
+
+        on_response_received_cb = multi_addparts_response_received_cb;
+        rk = create_txn_producer(&mcluster, txnid, 3,
+                                 "linger.ms", "0",
+                                 "message.timeout.ms", "9000",
+                                 /* Set up on_response_received interceptor */
+                                 "on_response_received", "", NULL);
+
+        /* Let broker 1 be txn coordinator. */
+        rd_kafka_mock_coordinator_set(mcluster, "transaction", txnid,
+                                      txn_coord);
+
+        rd_kafka_mock_topic_create(mcluster, topic, 3, 1);
+
+        /* Set partition leaders to non-txn-coord broker so they wont
+         * be affected by rtt delay */
+        rd_kafka_mock_partition_set_leader(mcluster, topic, 0, 1);
+        rd_kafka_mock_partition_set_leader(mcluster, topic, 1, 1);
+        rd_kafka_mock_partition_set_leader(mcluster, topic, 2, 1);
+
+
+
+        TEST_CALL_ERROR__(rd_kafka_init_transactions(rk, 5000));
+
+        /*
+         * Run one transaction first to let the client familiarize with
+         * the topic, this avoids metadata lookups, etc, when the real
+         * test is run.
+         */
+        TEST_SAY("Running seed transaction\n");
+        TEST_CALL_ERROR__(rd_kafka_begin_transaction(rk));
+        TEST_CALL_ERR__(rd_kafka_producev(rk,
+                                          RD_KAFKA_V_TOPIC(topic),
+                                          RD_KAFKA_V_VALUE("seed", 4),
+                                          RD_KAFKA_V_END));
+        TEST_CALL_ERROR__(rd_kafka_commit_transaction(rk, 5000));
+
+
+        /*
+         * Now perform test transaction with rtt delays
+         */
+        TEST_SAY("Running test transaction\n");
+
+        TEST_CALL_ERROR__(rd_kafka_begin_transaction(rk));
+
+        /* Reset counter */
+        rd_atomic32_set(&multi_addparts_resp_cnt, 0);
+
+        /* Add latency to txn coordinator so we can pace our produce() calls */
+        rd_kafka_mock_broker_set_rtt(mcluster, txn_coord, 1000);
+
+        /* Produce to partition 0 */
+        TEST_CALL_ERR__(rd_kafka_producev(rk,
+                                          RD_KAFKA_V_TOPIC(topic),
+                                          RD_KAFKA_V_PARTITION(0),
+                                          RD_KAFKA_V_VALUE("hi", 2),
+                                          RD_KAFKA_V_END));
+
+        rd_usleep(500*1000, NULL);
+
+        /* Produce to partition 1 */
+        TEST_CALL_ERR__(rd_kafka_producev(rk,
+                                          RD_KAFKA_V_TOPIC(topic),
+                                          RD_KAFKA_V_PARTITION(1),
+                                          RD_KAFKA_V_VALUE("hi", 2),
+                                          RD_KAFKA_V_END));
+
+        TEST_SAY("Waiting for two AddPartitionsToTxnResponse\n");
+        while (rd_atomic32_get(&multi_addparts_resp_cnt) < 2)
+                rd_usleep(10*1000, NULL);
+
+        TEST_SAY("%"PRId32" AddPartitionsToTxnResponses seen\n",
+                 rd_atomic32_get(&multi_addparts_resp_cnt));
+
+        /* Produce to partition 2, this message will hang in
+         * queue if the bug is not fixed. */
+        TEST_CALL_ERR__(rd_kafka_producev(rk,
+                                          RD_KAFKA_V_TOPIC(topic),
+                                          RD_KAFKA_V_PARTITION(2),
+                                          RD_KAFKA_V_VALUE("hi", 2),
+                                          RD_KAFKA_V_END));
+
+        /* Allow some extra time for things to settle before committing
+         * transaction. */
+        rd_usleep(1000*1000, NULL);
+
+        TEST_CALL_ERROR__(rd_kafka_commit_transaction(rk, 10*1000));
+
+        /* All done */
+        rd_kafka_destroy(rk);
+
+        on_response_received_cb = NULL;
+
+        SUB_TEST_PASS();
+}
+
+
+
+/**
+ * @brief Test handling of OffsetFetchRequest returning UNSTABLE_OFFSET_COMMIT.
+ *
+ * There are two things to test;
+ *  - OffsetFetch triggered by committed() (and similar code paths)
+ *  - OffsetFetch triggered by assign()
+ */
+static void do_test_unstable_offset_commit (void) {
+        rd_kafka_t *rk, *c;
+        rd_kafka_conf_t *c_conf;
+        rd_kafka_mock_cluster_t *mcluster;
+        rd_kafka_topic_partition_list_t *offsets;
+        const char *topic = "mytopic";
+        const int msgcnt = 100;
+        const int64_t offset_to_commit = msgcnt / 2;
+        int i;
+        int remains = 0;
+
+        SUB_TEST_QUICK();
+
+        rk = create_txn_producer(&mcluster, "txnid", 3, NULL);
+
+        test_conf_init(&c_conf, NULL, 0);
+        test_conf_set(c_conf, "security.protocol", "PLAINTEXT");
+        test_conf_set(c_conf, "bootstrap.servers",
+                      rd_kafka_mock_cluster_bootstraps(mcluster));
+        test_conf_set(c_conf, "enable.partition.eof", "true");
+        test_conf_set(c_conf, "auto.offset.reset", "error");
+        c = test_create_consumer("mygroup", NULL, c_conf, NULL);
+
+        rd_kafka_mock_topic_create(mcluster, topic, 2, 3);
+
+        /* Produce some messages to the topic so that the consumer has
+         * something to read. */
+        TEST_CALL_ERROR__(rd_kafka_init_transactions(rk, -1));
+        TEST_CALL_ERROR__(rd_kafka_begin_transaction(rk));
+        test_produce_msgs2_nowait(rk, topic, 0, 0, 0, msgcnt,
+                                  NULL, 0, &remains);
+        TEST_CALL_ERROR__(rd_kafka_commit_transaction(rk, -1));
+
+
+        /* Commit offset */
+        offsets = rd_kafka_topic_partition_list_new(1);
+        rd_kafka_topic_partition_list_add(offsets, topic, 0)->offset =
+                offset_to_commit;
+        TEST_CALL_ERR__(rd_kafka_commit(c, offsets, 0/*sync*/));
+        rd_kafka_topic_partition_list_destroy(offsets);
+
+        /* Retrieve offsets by calling committed().
+         *
+         * Have OffsetFetch fail and retry, on the first iteration
+         * the API timeout is higher than the amount of time the retries will
+         * take and thus succeed, and on the second iteration the timeout
+         * will be lower and thus fail. */
+        for (i = 0 ; i < 2 ; i++) {
+                rd_kafka_resp_err_t err;
+                rd_kafka_resp_err_t exp_err = i == 0 ?
+                        RD_KAFKA_RESP_ERR_NO_ERROR :
+                        RD_KAFKA_RESP_ERR__TIMED_OUT;
+                int timeout_ms = exp_err ? 200 : 5*1000;
+
+                rd_kafka_mock_push_request_errors(
+                        mcluster,
+                        RD_KAFKAP_OffsetFetch,
+                        1+5,/* first request + some retries */
+                        RD_KAFKA_RESP_ERR_UNSTABLE_OFFSET_COMMIT,
+                        RD_KAFKA_RESP_ERR_UNSTABLE_OFFSET_COMMIT,
+                        RD_KAFKA_RESP_ERR_UNSTABLE_OFFSET_COMMIT,
+                        RD_KAFKA_RESP_ERR_UNSTABLE_OFFSET_COMMIT,
+                        RD_KAFKA_RESP_ERR_UNSTABLE_OFFSET_COMMIT,
+                        RD_KAFKA_RESP_ERR_UNSTABLE_OFFSET_COMMIT);
+
+                offsets = rd_kafka_topic_partition_list_new(1);
+                rd_kafka_topic_partition_list_add(offsets, topic, 0);
+
+                err = rd_kafka_committed(c, offsets, timeout_ms);
+
+                TEST_SAY("#%d: committed() returned %s (expected %s)\n",
+                         i,
+                         rd_kafka_err2name(err),
+                         rd_kafka_err2name(exp_err));
+
+                TEST_ASSERT(err == exp_err,
+                            "#%d: Expected committed() to return %s, not %s",
+                            i,
+                            rd_kafka_err2name(exp_err),
+                            rd_kafka_err2name(err));
+                TEST_ASSERT(offsets->cnt == 1,
+                            "Expected 1 committed offset, not %d",
+                            offsets->cnt);
+                if (!exp_err)
+                        TEST_ASSERT(offsets->elems[0].offset == offset_to_commit,
+                                    "Expected committed offset %"PRId64", "
+                                    "not %"PRId64,
+                                    offset_to_commit,
+                                    offsets->elems[0].offset);
+                else
+                        TEST_ASSERT(offsets->elems[0].offset < 0,
+                                    "Expected no committed offset, "
+                                    "not %"PRId64,
+                                    offsets->elems[0].offset);
+
+                rd_kafka_topic_partition_list_destroy(offsets);
+        }
+
+        TEST_SAY("Phase 2: OffsetFetch lookup through assignment\n");
+        offsets = rd_kafka_topic_partition_list_new(1);
+        rd_kafka_topic_partition_list_add(offsets, topic, 0)->offset =
+                RD_KAFKA_OFFSET_STORED;
+
+        rd_kafka_mock_push_request_errors(
+                mcluster,
+                RD_KAFKAP_OffsetFetch,
+                1+5,/* first request + some retries */
+                RD_KAFKA_RESP_ERR_UNSTABLE_OFFSET_COMMIT,
+                RD_KAFKA_RESP_ERR_UNSTABLE_OFFSET_COMMIT,
+                RD_KAFKA_RESP_ERR_UNSTABLE_OFFSET_COMMIT,
+                RD_KAFKA_RESP_ERR_UNSTABLE_OFFSET_COMMIT,
+                RD_KAFKA_RESP_ERR_UNSTABLE_OFFSET_COMMIT,
+                RD_KAFKA_RESP_ERR_UNSTABLE_OFFSET_COMMIT);
+
+        test_consumer_incremental_assign("assign", c, offsets);
+        rd_kafka_topic_partition_list_destroy(offsets);
+
+        test_consumer_poll_exact("consume", c, 0,
+                                 1/*eof*/, 0, msgcnt/2,
+                                 rd_true/*exact counts*/, NULL);
+
+        /* All done */
+        rd_kafka_destroy(c);
+        rd_kafka_destroy(rk);
+
+        SUB_TEST_PASS();
+}
+
+
 int main_0105_transactions_mock (int argc, char **argv) {
         if (test_needs_auth()) {
                 TEST_SKIP("Mock cluster does not support SSL/SASL\n");
@@ -953,6 +2251,19 @@ int main_0105_transactions_mock (int argc, char **argv) {
         }
 
         do_test_txn_recoverable_errors();
+
+        do_test_txn_fatal_idempo_errors();
+
+        do_test_txn_endtxn_errors();
+
+        do_test_txn_endtxn_infinite();
+
+        /* Skip tests for non-infinite commit/abort timeouts
+         * until they're properly handled by the producer. */
+        if (0)
+                do_test_txn_endtxn_timeout();
+
+        do_test_txn_req_cnt();
 
         do_test_txn_requires_abort_errors();
 
@@ -966,6 +2277,12 @@ int main_0105_transactions_mock (int argc, char **argv) {
 
         do_test_txns_send_offsets_concurrent_is_retried();
 
+        do_test_txn_coord_req_destroy();
+
+        do_test_txn_coord_req_multi_find();
+
+        do_test_txn_addparts_req_multi();
+
         do_test_txns_no_timeout_crash();
 
         do_test_txn_auth_failure(
@@ -977,6 +2294,8 @@ int main_0105_transactions_mock (int argc, char **argv) {
                 RD_KAFKA_RESP_ERR_CLUSTER_AUTHORIZATION_FAILED);
 
         do_test_txn_flush_timeout();
+
+        do_test_unstable_offset_commit();
 
         if (!test_quick)
                 do_test_txn_switch_coordinator();

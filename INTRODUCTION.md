@@ -1041,10 +1041,9 @@ from any thread at any time:
 
 On initialization, librdkafka only needs a partial list of
 brokers (at least one), called the bootstrap brokers.
-The client will connect to the bootstrap brokers, specified by the
-`bootstrap.servers` (or `metadata.broker.list`) configuration property or
-by `rd_kafka_brokers_add()`, and query cluster Metadata information
-which contains the full list of brokers, topic, partitions and their
+The client will connect to the bootstrap brokers specified by the
+`bootstrap.servers` configuration property and query cluster Metadata
+information which contains the full list of brokers, topic, partitions and their
 leaders in the Kafka cluster.
 
 Broker names are specified as `host[:port]` where the port is optional
@@ -1143,7 +1142,7 @@ Examples of needed broker connections are:
 
 When there is no broker connection and a connection to any broker
 is needed, such as on startup to retrieve metadata, the client randomly selects
-a broker from its list of brokers, which includes both the configure bootstrap
+a broker from its list of brokers, which includes both the configured bootstrap
 brokers (including brokers manually added with `rd_kafka_brokers_add()`), as
 well as the brokers discovered from cluster metadata.
 Brokers with no prior connection attempt are tried first.
@@ -1460,6 +1459,21 @@ The latest stored offset will be automatically committed every
           offset was 10 and the application performs an offsets_store()
           with offset 9, that offset will not be committed.
 
+
+##### Auto offset reset
+
+The consumer will by default try to acquire the last committed offsets for
+each topic+partition it is assigned using its configured `group.id`.
+If there is no committed offset available, or the consumer is unable to
+fetch the committed offsets, the policy of `auto.offset.reset` will kick in.
+This configuration property may be set to one the following values:
+
+ * `earliest` - start consuming the earliest message of the partition.
+ * `latest` - start consuming the next message to be produced to the partition.
+ * `error` - don't start consuming but isntead raise a consumer error
+              with error-code `RD_KAFKA_RESP_ERR__AUTO_OFFSET_RESET` for
+              the topic+partition. This allows the application to decide what
+              to do in case there is no committed start offset.
 
 
 ### Consumer groups
