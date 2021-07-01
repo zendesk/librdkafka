@@ -44,6 +44,7 @@ typedef	enum {
         RD_KAFKA_BROKER_STATE_DOWN,
         RD_KAFKA_BROKER_STATE_TRY_CONNECT,
         RD_KAFKA_BROKER_STATE_CONNECT,
+        RD_KAFKA_BROKER_STATE_SSL_HANDSHAKE,
         RD_KAFKA_BROKER_STATE_AUTH_LEGACY,
 
         /* Any state >= STATE_UP means the Kafka protocol layer
@@ -184,12 +185,12 @@ struct rd_kafka_broker_s { /* rd_kafka_broker_t */
 
                 rd_atomic64_t reqtype[RD_KAFKAP__NUM]; /**< Per request-type
                                                         *   counter */
+
+                rd_atomic64_t ts_send;       /**< Timestamp of last send */
+                rd_atomic64_t ts_recv;       /**< Timestamp of last receive */
 	} rkb_c;
 
         int                 rkb_req_timeouts;  /* Current value */
-
-        rd_atomic64_t       rkb_ts_tx_last;    /**< Timestamp of last
-                                                *   transmitted requested */
 
 	thrd_t              rkb_thread;
 

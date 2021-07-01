@@ -133,6 +133,13 @@ struct rd_kafka_property {
                 "OpenSSL >= 1.0.2 not available at build time"
 #endif
 
+#if OPENSSL_VERSION_NUMBER >= 0x10100000 && defined(WITH_SSL) && !defined(LIBRESSL_VERSION_NUMBER)
+#define _UNSUPPORTED_OPENSSL_1_1_0 .unsupported = NULL
+#else
+#define _UNSUPPORTED_OPENSSL_1_1_0 .unsupported = \
+                "OpenSSL >= 1.1.0 not available at build time"
+#endif
+
 
 #if WITH_ZLIB
 #define _UNSUPPORTED_ZLIB .unsupported = NULL
@@ -240,6 +247,21 @@ rd_kafka_anyconf_is_modified (const void *conf,
         return !!(confhdr->modified[bkt] & bit);
 }
 
+/**
+ * @returns true if any property in \p conf has been set/modified.
+ */
+static rd_bool_t
+rd_kafka_anyconf_is_any_modified (const void *conf) {
+        const struct rd_kafka_anyconf_hdr *confhdr = conf;
+        int i;
+
+        for (i = 0 ; i < (int)RD_ARRAYSIZE(confhdr->modified) ; i++)
+                if (confhdr->modified[i])
+                        return rd_true;
+
+        return rd_false;
+}
+
 
 
 /**
@@ -306,7 +328,6 @@ static const struct rd_kafka_property rd_kafka_properties[] = {
                         },
                         { 0x400, "zstd", _UNSUPPORTED_ZSTD },
                         { 0x800, "sasl_oauthbearer", _UNSUPPORTED_SSL },
-                        { 0x1000, "ssl_client_cert_callback", _UNSUPPORTED_OPENSSL_1_0_2 },
                         { 0, NULL }
                 }
 	},
@@ -379,11 +400,11 @@ static const struct rd_kafka_property rd_kafka_properties[] = {
 	  1, 1000000, 1000000 },
         { _RK_GLOBAL, "max.in.flight", _RK_C_ALIAS,
           .sdef = "max.in.flight.requests.per.connection" },
-	{ _RK_GLOBAL, "metadata.request.timeout.ms", _RK_C_INT,
-	  _RK(metadata_request_timeout_ms),
-	  "Non-topic request timeout in milliseconds. "
-	  "This is for metadata requests, etc.",
-	  10, 900*1000, 60*1000},
+        { _RK_GLOBAL|_RK_DEPRECATED|_RK_HIDDEN,
+          "metadata.request.timeout.ms", _RK_C_INT,
+          _RK(metadata_request_timeout_ms),
+          "Not used.",
+          10, 900*1000, 10 },
         { _RK_GLOBAL, "topic.metadata.refresh.interval.ms", _RK_C_INT,
           _RK(metadata_refresh_interval_ms),
           "Period of time in milliseconds at which topic and broker "
@@ -523,6 +544,17 @@ static const struct rd_kafka_property rd_kafka_properties[] = {
                         { AF_INET, "v4" },
                         { AF_INET6, "v6" },
                 } },
+        { _RK_GLOBAL|_RK_MED, "connections.max.idle.ms",
+          _RK_C_INT,
+          _RK(connections_max_idle_ms),
+          "Close broker connections after the specified time of "
+          "inactivity. "
+          "Disable with 0. "
+          "If this property is left at its default value some heuristics are "
+          "performed to determine a suitable default value, this is currently "
+          "limited to identifying brokers on Azure "
+          "(see librdkafka issue #3109 for more info).",
+          0, INT_MAX, 0 },
         { _RK_GLOBAL|_RK_MED|_RK_HIDDEN, "enable.sparse.connections",
           _RK_C_BOOL,
           _RK(sparse_connections),
@@ -824,6 +856,23 @@ static const struct rd_kafka_property rd_kafka_properties[] = {
           "Client's keystore (PKCS#12) password.",
           _UNSUPPORTED_SSL
         },
+        { _RK_GLOBAL, "ssl.engine.location", _RK_C_STR,
+          _RK(ssl.engine_location),
+          "Path to OpenSSL engine library. OpenSSL >= 1.1.0 required.",
+          _UNSUPPORTED_OPENSSL_1_1_0
+        },
+        { _RK_GLOBAL, "ssl.engine.id", _RK_C_STR,
+          _RK(ssl.engine_id),
+          "OpenSSL engine id is the name used for loading engine.",
+          .sdef = "dynamic",
+          _UNSUPPORTED_OPENSSL_1_1_0
+        },
+        { _RK_GLOBAL, "ssl_engine_callback_data", _RK_C_PTR,
+          _RK(ssl.engine_callback_data),
+          "OpenSSL engine callback data (set "
+          "with rd_kafka_conf_set_engine_callback_data()).",
+          _UNSUPPORTED_OPENSSL_1_1_0
+        },
         { _RK_GLOBAL, "enable.ssl.certificate.verification", _RK_C_BOOL,
           _RK(ssl.enable_verify),
           "Enable OpenSSL's builtin broker (server) certificate verification. "
@@ -1050,7 +1099,7 @@ static const struct rd_kafka_property rd_kafka_properties[] = {
           "properties `group.min.session.timeout.ms` and "
           "`group.max.session.timeout.ms`. "
           "Also see `max.poll.interval.ms`.",
-          1, 3600*1000, 10*1000 },
+          1, 3600*1000, 45*1000 },
         { _RK_GLOBAL|_RK_CGRP, "heartbeat.interval.ms", _RK_C_INT,
           _RK(group_heartbeat_intvl_ms),
           "Group session keepalive heartbeat interval.",
@@ -1531,8 +1580,7 @@ static const struct rd_kafka_property rd_kafka_properties[] = {
 	  "process restarts to pick up where it left off. "
 	  "If false, the application will have to call "
 	  "`rd_kafka_offset_store()` to store an offset (optional). "
-	  "**NOTE:** There is currently no zookeeper integration, offsets "
-	  "will be written to broker or local file according to "
+          "Offsets will be written to broker or local file according to "
           "offset.store.method.",
 	  0, 1, 1 },
 	{ _RK_TOPIC|_RK_CONSUMER, "enable.auto.commit", _RK_C_ALIAS,
@@ -2819,26 +2867,22 @@ rd_kafka_conf_set_ssl_cert_verify_cb (
 #endif
 }
 
-rd_kafka_conf_res_t
-rd_kafka_conf_set_ssl_cert_fetch_cb(
-		rd_kafka_conf_t *conf,
-        int (*ssl_cert_fetch_cb) (rd_kafka_t *rk,
-                                  const char *broker_name,
-                                  int32_t broker_id,
-                                  char *buf, size_t *buf_size,
-                                  char **leaf_cert, size_t *leaf_cert_size,
-                                  char **pkey, size_t *pkey_size,
-                                  char *chain_cert[16], size_t chain_cert_size[16],
-                                  rd_kafka_cert_enc_t *format,
-                                  void *opaque)) {
-
+rd_kafka_conf_res_t rd_kafka_conf_set_ssl_cert_fetch_cb (
+        rd_kafka_conf_t *conf,
+        rd_kafka_cert_fetch_cb_res_t (*ssl_cert_fetch_cb) (rd_kafka_t *rk,
+                                                           const char *broker_name,
+                                                           int32_t broker_id,
+                                                           rd_kafka_ssl_cert_fetch_cb_certs_t *certsp,
+                                                           char *errstr, size_t errstr_size,
+                                                           void *opaque)) {
 #if defined(WITH_SSL) && OPENSSL_VERSION_NUMBER >= 0x1000200fL
-    rd_kafka_anyconf_set_internal(_RK_GLOBAL, conf,"ssl.certificate.fetch_cb", ssl_cert_fetch_cb);
-    return RD_KAFKA_CONF_OK;
+        rd_kafka_anyconf_set_internal(_RK_GLOBAL, conf, "ssl.certificate.fetch_cb", ssl_cert_fetch_cb);
+        return RD_KAFKA_CONF_OK;
 #else
-    return RD_KAFKA_CONF_INVALID;
+        return RD_KAFKA_CONF_INVALID;
 #endif
 }
+
 
 
 void rd_kafka_conf_set_opaque (rd_kafka_conf_t *conf, void *opaque) {
@@ -2846,10 +2890,21 @@ void rd_kafka_conf_set_opaque (rd_kafka_conf_t *conf, void *opaque) {
 }
 
 
+void rd_kafka_conf_set_engine_callback_data (rd_kafka_conf_t *conf,
+                                             void *callback_data) {
+        rd_kafka_anyconf_set_internal(_RK_GLOBAL, conf,
+                                      "ssl_engine_callback_data",
+                                      callback_data);
+}
+
+
 void rd_kafka_conf_set_default_topic_conf (rd_kafka_conf_t *conf,
                                            rd_kafka_topic_conf_t *tconf) {
-        if (conf->topic_conf)
+        if (conf->topic_conf) {
+                if (rd_kafka_anyconf_is_any_modified(conf->topic_conf))
+                        conf->warn.default_topic_conf_overwritten = rd_true;
                 rd_kafka_topic_conf_destroy(conf->topic_conf);
+        }
 
         rd_kafka_anyconf_set_internal(_RK_GLOBAL, conf, "default_topic_conf",
                                       tconf);
@@ -3823,6 +3878,14 @@ const char *rd_kafka_conf_finalize (rd_kafka_type_t cltype,
                         RD_MAX(11, RD_MIN(conf->reconnect_backoff_ms/2, 1000));
         }
 
+        if (!rd_kafka_conf_is_modified(conf, "connections.max.idle.ms") &&
+            conf->brokerlist &&
+            rd_strcasestr(conf->brokerlist, "azure")) {
+                /* Issue #3109:
+                 * Default connections.max.idle.ms to <4 minutes on Azure. */
+                conf->connections_max_idle_ms = (4*60-10) * 1000;
+        }
+
         if (!rd_kafka_conf_is_modified(conf, "allow.auto.create.topics")) {
                 /* Consumer: Do not allow auto create by default.
                  * Producer: Allow auto create by default. */
@@ -3994,6 +4057,14 @@ int rd_kafka_conf_warn (rd_kafka_t *rk) {
         if (rk->rk_conf.topic_conf)
                 cnt += rd_kafka_anyconf_warn_deprecated(
                         rk, _RK_TOPIC, rk->rk_conf.topic_conf);
+
+        if (rk->rk_conf.warn.default_topic_conf_overwritten)
+                rd_kafka_log(rk, LOG_WARNING,
+                             "CONFWARN",
+                             "Topic configuration properties set in the "
+                             "global configuration were overwritten by "
+                             "explicitly setting a default_topic_conf: "
+                             "recommend not using set_default_topic_conf");
 
         /* Additional warnings */
         if (rk->rk_type == RD_KAFKA_CONSUMER) {

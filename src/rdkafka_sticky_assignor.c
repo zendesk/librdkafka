@@ -733,15 +733,15 @@ isBalanced (rd_kafka_t *rk,
                 consumerPartitions = (const rd_kafka_topic_partition_list_t *)
                         elem->value;
 
+                potentialTopicPartitions =
+                        RD_MAP_GET(consumer2AllPotentialPartitions, consumer);
+
                 /* Skip if this consumer already has all the topic partitions
                  * it can get. */
-                if (consumerPartitions->cnt ==
-                    (int)RD_MAP_CNT(consumer2AllPotentialPartitions))
+                if (consumerPartitions->cnt == potentialTopicPartitions->cnt)
                         continue;
 
                 /* Otherwise make sure it can't get any more partitions */
-                potentialTopicPartitions =
-                        RD_MAP_GET(consumer2AllPotentialPartitions, consumer);
 
                 for (i = 0 ; i < potentialTopicPartitions->cnt ; i++) {
                         const rd_kafka_topic_partition_t *partition =
@@ -941,7 +941,7 @@ static int getBalanceScore (map_str_toppar_list_t *assignment) {
 
         for (next = 0 ; next < cnt ; next++)
                 for (i = next+1 ; i < cnt ; i++)
-                        score = abs(sizes[next] - sizes[i]);
+                        score += abs(sizes[next] - sizes[i]);
 
         rd_free(sizes);
 
@@ -977,7 +977,7 @@ balance (rd_kafka_t *rk,
         rd_bool_t initializing =
                 ((const rd_kafka_topic_partition_list_t *)
                  ((const rd_map_elem_t *)rd_list_last(
-                         sortedCurrentSubscriptions))->key)->cnt == 0;
+                         sortedCurrentSubscriptions))->value)->cnt == 0;
         rd_bool_t reassignmentPerformed = rd_false;
 
         map_str_toppar_list_t fixedAssignments =
@@ -1237,11 +1237,11 @@ prepopulateCurrentAssignments (
                            rd_kafka_topic_partition_list_new(
                                    (int)estimated_partition_cnt));
 
-                if (!consumer->rkgm_assignment)
+                if (!consumer->rkgm_owned)
                         continue;
 
-                for (j = 0 ; j < (int)consumer->rkgm_assignment->cnt ; j++) {
-                        partition = &consumer->rkgm_assignment->elems[j];
+                for (j = 0 ; j < (int)consumer->rkgm_owned->cnt ; j++) {
+                        partition = &consumer->rkgm_owned->elems[j];
 
                         consumers = RD_MAP_GET_OR_SET(
                                 &sortedPartitionConsumersByGeneration,
@@ -2025,8 +2025,31 @@ static void rd_kafka_sticky_assignor_state_destroy (void *assignor_state) {
  */
 
 
+
+/**
+ * @brief Set a member's owned partitions based on its assignment.
+ *
+ * For use between assignor_run(). This is mimicing a consumer receiving
+ * its new assignment and including it in the next rebalance as its
+ * owned-partitions.
+ */
+static void ut_set_owned (rd_kafka_group_member_t *rkgm) {
+        if (rkgm->rkgm_owned)
+                rd_kafka_topic_partition_list_destroy(rkgm->rkgm_owned);
+
+        rkgm->rkgm_owned =
+                rd_kafka_topic_partition_list_copy(rkgm->rkgm_assignment);
+}
+
+
+/**
+ * @brief Verify assignment validity and balance.
+ *
+ * @remark Also updates the members owned partitions to the assignment.
+ */
+
 static int verifyValidityAndBalance0 (const char *func, int line,
-                                      const rd_kafka_group_member_t *members,
+                                      rd_kafka_group_member_t *members,
                                       size_t member_cnt,
                                       const rd_kafka_metadata_t *metadata) {
         int fails = 0;
@@ -2073,6 +2096,10 @@ static int verifyValidityAndBalance0 (const char *func, int line,
                                 fails++;
                         }
                 }
+
+                /* Update the member's owned partitions to match
+                 * the assignment. */
+                ut_set_owned(&members[i]);
 
                 if (i == (int)member_cnt - 1)
                         continue;
@@ -2174,6 +2201,19 @@ static int isFullyBalanced0 (const char *function, int line,
         } while (0)
 
 
+static void
+ut_print_toppar_list (const rd_kafka_topic_partition_list_t *partitions) {
+        int i;
+
+        for (i = 0 ; i < partitions->cnt ; i++)
+                RD_UT_SAY(" %s [%"PRId32"]",
+                          partitions->elems[i].topic,
+                          partitions->elems[i].partition);
+}
+
+
+
+
 /**
  * @brief Verify that member's assignment matches the expected partitions.
  *
@@ -2214,6 +2254,9 @@ static int verifyAssignment0 (const char *function, int line,
                            rkgm->rkgm_assignment->cnt);
                 fails++;
         }
+
+        if (fails)
+                ut_print_toppar_list(rkgm->rkgm_assignment);
 
         RD_UT_ASSERT(!fails, "%s:%d: See previous errors", function, line);
 
@@ -2771,8 +2814,8 @@ static int ut_testAddRemoveTopicTwoConsumers (rd_kafka_t *rk,
                          NULL);
         verifyAssignment(&members[1],
                          "topic1", 1,
-                         "topic2", 0,
                          "topic2", 2,
+                         "topic2", 0,
                          NULL);
 
         verifyValidityAndBalance(members, RD_ARRAYSIZE(members), metadata);
@@ -3208,7 +3251,7 @@ static int ut_testMoveExistingAssignments (rd_kafka_t *rk,
                                    members[i].rkgm_assignment->
                                    elems[0].partition)) {
                         RD_UT_WARN("Stickiness was not honored for %s, "
-                                   "%s [%"PRId32"] not in previouis assignment",
+                                   "%s [%"PRId32"] not in previous assignment",
                                    members[i].rkgm_member_id->str,
                                    members[i].rkgm_assignment->elems[0].topic,
                                    members[i].rkgm_assignment->
@@ -3284,6 +3327,128 @@ static int ut_testStickiness (rd_kafka_t *rk, const rd_kafka_assignor_t *rkas) {
 
         verifyValidityAndBalance(members, RD_ARRAYSIZE(members), metadata);
 
+
+        for (i = 0 ; i < member_cnt ; i++)
+                rd_kafka_group_member_clear(&members[i]);
+        rd_kafka_metadata_destroy(metadata);
+
+        RD_UT_PASS();
+}
+
+
+/**
+ * @brief Verify stickiness across three rebalances.
+ */
+static int
+ut_testStickiness2 (rd_kafka_t *rk, const rd_kafka_assignor_t *rkas) {
+        rd_kafka_resp_err_t err;
+        char errstr[512];
+        rd_kafka_metadata_t *metadata;
+        rd_kafka_group_member_t members[3];
+        int member_cnt = RD_ARRAYSIZE(members);
+        int i;
+
+        metadata = rd_kafka_metadata_new_topic_mockv(1, "topic1", 6);
+
+        ut_init_member(&members[0], "consumer1", "topic1", NULL);
+        ut_init_member(&members[1], "consumer2", "topic1", NULL);
+        ut_init_member(&members[2], "consumer3", "topic1", NULL);
+
+        /* Just consumer1 */
+        err = rd_kafka_assignor_run(rk->rk_cgrp, rkas, metadata,
+                                    members, 1,
+                                    errstr, sizeof(errstr));
+        RD_UT_ASSERT(!err, "assignor run failed: %s", errstr);
+
+        verifyValidityAndBalance(members, 1, metadata);
+        isFullyBalanced(members, 1);
+        verifyAssignment(&members[0],
+                         "topic1", 0,
+                         "topic1", 1,
+                         "topic1", 2,
+                         "topic1", 3,
+                         "topic1", 4,
+                         "topic1", 5,
+                         NULL);
+
+        /* consumer1 and consumer2 */
+        err = rd_kafka_assignor_run(rk->rk_cgrp, rkas, metadata,
+                                    members, 2,
+                                    errstr, sizeof(errstr));
+        RD_UT_ASSERT(!err, "assignor run failed: %s", errstr);
+
+        verifyValidityAndBalance(members, 2, metadata);
+        isFullyBalanced(members, 2);
+        verifyAssignment(&members[0],
+                         "topic1", 3,
+                         "topic1", 4,
+                         "topic1", 5,
+                         NULL);
+        verifyAssignment(&members[1],
+                         "topic1", 0,
+                         "topic1", 1,
+                         "topic1", 2,
+                         NULL);
+
+        /* Run it twice, should be stable. */
+        for (i = 0 ; i < 2 ; i++) {
+                /* consumer1, consumer2, and consumer3 */
+                err = rd_kafka_assignor_run(rk->rk_cgrp, rkas, metadata,
+                                            members, 3,
+                                            errstr, sizeof(errstr));
+                RD_UT_ASSERT(!err, "assignor run failed: %s", errstr);
+
+                verifyValidityAndBalance(members, 3, metadata);
+                isFullyBalanced(members, 3);
+                verifyAssignment(&members[0],
+                                 "topic1", 4,
+                                 "topic1", 5,
+                                 NULL);
+                verifyAssignment(&members[1],
+                                 "topic1", 1,
+                                 "topic1", 2,
+                                 NULL);
+                verifyAssignment(&members[2],
+                                 "topic1", 0,
+                                 "topic1", 3,
+                                 NULL);
+        }
+
+        /* Remove consumer1 */
+        err = rd_kafka_assignor_run(rk->rk_cgrp, rkas, metadata,
+                                    &members[1], 2,
+                                    errstr, sizeof(errstr));
+        RD_UT_ASSERT(!err, "assignor run failed: %s", errstr);
+
+        verifyValidityAndBalance(&members[1], 2, metadata);
+        isFullyBalanced(&members[1], 2);
+        verifyAssignment(&members[1],
+                         "topic1", 1,
+                         "topic1", 2,
+                         "topic1", 5,
+                         NULL);
+        verifyAssignment(&members[2],
+                         "topic1", 0,
+                         "topic1", 3,
+                         "topic1", 4,
+                         NULL);
+
+        /* Remove consumer2 */
+        err = rd_kafka_assignor_run(rk->rk_cgrp, rkas, metadata,
+                                    &members[2], 1,
+                                    errstr, sizeof(errstr));
+        RD_UT_ASSERT(!err, "assignor run failed: %s", errstr);
+
+        verifyValidityAndBalance(&members[2], 1, metadata);
+        isFullyBalanced(&members[2], 1);
+        verifyAssignment(&members[2],
+                         "topic1", 0,
+                         "topic1", 1,
+                         "topic1", 2,
+                         "topic1", 3,
+                         "topic1", 4,
+                         "topic1", 5,
+                         NULL);
 
         for (i = 0 ; i < member_cnt ; i++)
                 rd_kafka_group_member_clear(&members[i]);
@@ -3458,6 +3623,7 @@ static int rd_kafka_sticky_assignor_unittest (void) {
                 ut_testNewSubscription,
                 ut_testMoveExistingAssignments,
                 ut_testStickiness,
+                ut_testStickiness2,
                 ut_testAssignmentUpdatedForDeletedTopic,
                 ut_testNoExceptionThrownWhenOnlySubscribedTopicDeleted,
                 ut_testConflictingPreviousAssignments,

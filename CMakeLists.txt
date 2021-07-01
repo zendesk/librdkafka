@@ -79,7 +79,7 @@ endif()
 # }
 
 # WITH_PLUGINS {
-if(WITH_LIBDL)
+if(WITH_LIBDL OR WIN32)
   set(with_plugins_default ON)
 else()
   set(with_plugins_default OFF)
@@ -133,6 +133,9 @@ else()
 endif()
 option(WITH_SASL "With SASL" ${with_sasl_default})
 if(WITH_SASL)
+  if(SASL_FOUND)
+    link_directories(${SASL_LIBRARY_DIRS})
+  endif()
   if(WITH_SSL)
     set(WITH_SASL_SCRAM ON)
     set(WITH_SASL_OAUTHBEARER ON)
@@ -177,6 +180,7 @@ endif(WIN32)
 # * HAVE_STRNDUP
 # * HAVE_PTHREAD_SETNAME_GNU
 # * HAVE_PTHREAD_SETNAME_DARWIN
+# * HAVE_PTHREAD_SETNAME_FREEBSD
 # * WITH_C11THREADS
 # * WITH_CRC32C_HW
 # * LINK_ATOMIC
@@ -205,6 +209,7 @@ set(GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 # * HAVE_STRNDUP
 # * HAVE_PTHREAD_SETNAME_GNU
 # * HAVE_PTHREAD_SETNAME_DARWIN
+# * HAVE_PTHREAD_SETNAME_FREEBSD
 list(APPEND BUILT_WITH "SNAPPY")
 list(APPEND BUILT_WITH "SOCKEM")
 string(REPLACE ";" " " BUILT_WITH "${BUILT_WITH}")
@@ -255,8 +260,6 @@ install(
     FILES LICENSES.txt
     DESTINATION "share/licenses/librdkafka"
 )
-
-# }
 
 add_subdirectory(src)
 add_subdirectory(src-cpp)

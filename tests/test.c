@@ -77,6 +77,7 @@ int          test_rusage = 0; /**< Check resource usage */
 double       test_rusage_cpu_calibration = 1.0;
 static const char *tests_to_run = NULL; /* all */
 static const char *subtests_to_run = NULL; /* all */
+static const char *tests_to_skip = NULL; /* none */
 int          test_write_report = 0; /**< Write test report file */
 
 static int show_summary = 1;
@@ -230,7 +231,10 @@ _TEST_DECL(0118_commit_rebalance);
 _TEST_DECL(0119_consumer_auth);
 _TEST_DECL(0120_asymmetric_subscription);
 _TEST_DECL(0121_clusterid);
-_TEST_DECL(0122_ssl_cb);
+_TEST_DECL(0122_buffer_cleaning_after_rebalance);
+_TEST_DECL(0123_connections_max_idle);
+_TEST_DECL(0124_openssl_invalid_engine);
+_TEST_DECL(0125_ssl_cb);
 
 /* Manual tests */
 _TEST_DECL(8000_idle);
@@ -432,7 +436,10 @@ struct test tests[] = {
         _TEST(0119_consumer_auth, 0, TEST_BRKVER(2,1,0,0)),
         _TEST(0120_asymmetric_subscription, TEST_F_LOCAL),
         _TEST(0121_clusterid, TEST_F_LOCAL),
-        _TEST(0122_ssl_cb, 0),
+        _TEST(0122_buffer_cleaning_after_rebalance, TEST_BRKVER(2,4,0,0)),
+        _TEST(0123_connections_max_idle, 0),
+        _TEST(0124_openssl_invalid_engine, TEST_F_LOCAL),
+        _TEST(0125_ssl_cb, 0),
 
         /* Manual tests */
         _TEST(8000_idle, TEST_F_MANUAL),
@@ -1251,7 +1258,8 @@ static void run_tests (int argc, char **argv) {
                 } else if (!tests_to_run && (test->flags & TEST_F_MANUAL)) {
                         skip_reason = "manual test";
                         skip_silent = rd_true;
-                }
+                } else if (tests_to_skip && strstr(tests_to_skip, testnum))
+                        skip_reason = "included in TESTS_SKIP list";
 
                 if (!skip_reason) {
                         run_test(test, argc, argv);
@@ -1573,6 +1581,7 @@ int main(int argc, char **argv) {
 #endif
         tests_to_run = test_getenv("TESTS", NULL);
         subtests_to_run = test_getenv("SUBTESTS", NULL);
+        tests_to_skip = test_getenv("TESTS_SKIP", NULL);
         tmpver = test_getenv("TEST_KAFKA_VERSION", NULL);
         if (!tmpver)
                 tmpver = test_getenv("KAFKA_VERSION", test_broker_version_str);
@@ -1739,6 +1748,8 @@ int main(int argc, char **argv) {
 	TEST_SAY("Tests to run : %s\n", tests_to_run ? tests_to_run : "all");
         if (subtests_to_run)
                 TEST_SAY("Sub tests    : %s\n", subtests_to_run);
+        if (tests_to_skip)
+                TEST_SAY("Skip tests   : %s\n", tests_to_skip);
         TEST_SAY("Test mode    : %s%s%s\n",
                  test_quick ? "quick, ":"",
                  test_mode,
@@ -2688,6 +2699,67 @@ void test_consumer_wait_assignment (rd_kafka_t *rk, rd_bool_t do_poll) {
 
 
 /**
+ * @brief Verify that the consumer's assignment matches the expected assignment.
+ *
+ * The va-list is a NULL-terminated list of (const char *topic, int partition)
+ * tuples.
+ *
+ * Fails the test on mismatch, unless \p fail_immediately is false.
+ */
+void test_consumer_verify_assignment0 (const char *func, int line,
+                                       rd_kafka_t *rk,
+                                       int fail_immediately, ...) {
+        va_list ap;
+        int cnt = 0;
+        const char *topic;
+        rd_kafka_topic_partition_list_t *assignment;
+        rd_kafka_resp_err_t err;
+        int i;
+
+        if ((err = rd_kafka_assignment(rk, &assignment)))
+                TEST_FAIL("%s:%d: Failed to get assignment for %s: %s",
+                          func, line, rd_kafka_name(rk), rd_kafka_err2str(err));
+
+        TEST_SAY("%s assignment (%d partition(s)):\n", rd_kafka_name(rk),
+                 assignment->cnt);
+        for (i = 0 ; i < assignment->cnt ; i++)
+                TEST_SAY(" %s [%"PRId32"]\n",
+                         assignment->elems[i].topic,
+                         assignment->elems[i].partition);
+
+        va_start(ap, fail_immediately);
+        while ((topic = va_arg(ap, const char *))) {
+                int partition = va_arg(ap, int);
+                cnt++;
+
+                if (!rd_kafka_topic_partition_list_find(assignment,
+                                                        topic, partition))
+                        TEST_FAIL_LATER(
+                                "%s:%d: Expected %s [%d] not found in %s's "
+                                "assignment (%d partition(s))",
+                                func, line,
+                                topic, partition, rd_kafka_name(rk),
+                                assignment->cnt);
+        }
+        va_end(ap);
+
+        if (cnt != assignment->cnt)
+                TEST_FAIL_LATER(
+                        "%s:%d: "
+                        "Expected %d assigned partition(s) for %s, not %d",
+                        func, line, cnt, rd_kafka_name(rk), assignment->cnt);
+
+        if (fail_immediately)
+                TEST_LATER_CHECK();
+
+        rd_kafka_topic_partition_list_destroy(assignment);
+}
+
+
+
+
+
+/**
  * @brief Start subscribing for 'topic'
  */
 void test_consumer_subscribe (rd_kafka_t *rk, const char *topic) {
@@ -3058,7 +3130,8 @@ int test_msgver_add_msg0 (const char *func, int line, const char *clientname,
                 test_msgver_add_msg0(func, line, clientname,
                                      mv->fwd, rkmessage, override_topic);
 
-	if (rkmessage->err) {
+        if (rd_kafka_message_status(rkmessage) ==
+            RD_KAFKA_MSG_STATUS_NOT_PERSISTED && rkmessage->err) {
 		if (rkmessage->err != RD_KAFKA_RESP_ERR__PARTITION_EOF)
 			return 0; /* Ignore error */
 
@@ -5264,6 +5337,11 @@ void test_wait_topic_exists (rd_kafka_t *rk, const char *topic, int tmout) {
         rd_kafka_metadata_topic_t topics = { .topic = (char *)topic };
 
         test_wait_metadata_update(rk, &topics, 1, NULL, 0, tmout);
+
+        /* Wait an additional second for the topic to propagate in
+         * the cluster. This is not perfect but a cheap workaround for
+         * the asynchronous nature of topic creations in Kafka. */
+        rd_sleep(1);
 }
 
 
@@ -6355,6 +6433,8 @@ int test_sub_start (const char *func, int line, int is_quick,
                             "%s:%d", func, line);
         }
 
+        TIMING_START(&test_curr->subtest_duration, "SUBTEST");
+
         TEST_SAY(_C_MAG "[ %s ]\n", test_curr->subtest);
 
         return 1;
@@ -6362,15 +6442,47 @@ int test_sub_start (const char *func, int line, int is_quick,
 
 
 /**
+ * @brief Reset the current subtest state.
+ */
+static void test_sub_reset(void) {
+        *test_curr->subtest      = '\0';
+        test_curr->is_fatal_cb   = NULL;
+        test_curr->ignore_dr_err = rd_false;
+        test_curr->exp_dr_err    = RD_KAFKA_RESP_ERR_NO_ERROR;
+        /* Don't check msg status by default */
+        test_curr->exp_dr_status = (rd_kafka_msg_status_t)-1;
+        test_curr->dr_mv         = NULL;
+}
+
+/**
  * @brief Sub-test has passed.
  */
 void test_sub_pass (void) {
+
         TEST_ASSERT(*test_curr->subtest);
 
-        TEST_SAY(_C_GRN "[ %s: PASS ]\n", test_curr->subtest);
-        *test_curr->subtest = '\0';
-        test_curr->is_fatal_cb = NULL;
-        test_curr->ignore_dr_err = rd_false;
-        test_curr->exp_dr_err = RD_KAFKA_RESP_ERR_NO_ERROR;
-        test_curr->dr_mv = NULL;
+        TEST_SAYL(1, _C_GRN "[ %s: PASS (%.02fs) ]\n", test_curr->subtest,
+                  (float)(TIMING_DURATION(&test_curr->subtest_duration) /
+                          1000000.0f));
+
+        test_sub_reset();
+}
+
+
+/**
+ * @brief Skip sub-test (must have been started with SUB_TEST*()).
+ */
+void test_sub_skip (const char *fmt, ...) {
+        va_list ap;
+        char buf[256];
+
+        TEST_ASSERT(*test_curr->subtest);
+
+        va_start(ap, fmt);
+        rd_vsnprintf(buf, sizeof(buf), fmt, ap);
+        va_end(ap);
+
+        TEST_SAYL(1, _C_YEL "[ %s: SKIP: %s ]\n", test_curr->subtest, buf);
+
+        test_sub_reset();
 }

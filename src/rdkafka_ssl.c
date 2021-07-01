@@ -37,10 +37,12 @@
 #include "rdkafka_cert.h"
 
 #ifdef _WIN32
+#include <wincrypt.h>
 #pragma comment (lib, "crypt32.lib")
 #endif
 
 #include <openssl/x509.h>
+#include <openssl/x509_vfy.h>
 
 #include <ctype.h>
 
@@ -132,8 +134,10 @@ static char *rd_kafka_ssl_error (rd_kafka_t *rk, rd_kafka_broker_t *rkb,
         int line, flags;
         int cnt = 0;
 
-        if (!rk)
+        if (!rk) {
+                rd_assert(rkb);
                 rk = rkb->rkb_rk;
+        }
 
         while ((l = ERR_get_error_line_data(&file, &line,
                                             &data, &flags)) != 0) {
@@ -417,60 +421,68 @@ rd_kafka_transport_ssl_cert_verify_cb (int preverify_ok,
         return 1; /* verification successful */
 }
 
+/**
+ * @brief OpenSSL callback to set client certificates on-demand when
+ *        connecting to a broker.
+ *
+ * @return 1 on success when certificates are attached to the ssl
+ *         instance and 0 on failure.
+ *
+ * @sa SSL_CTX_set_cert_cb()
+ */
 #if OPENSSL_VERSION_NUMBER >= 0x1000200fL && !defined(LIBRESSL_VERSION_NUMBER)
-static int rd_kafka_transport_ssl_cert_fetch_cb(SSL *ssl, void *arg) {
+static int rd_kafka_transport_ssl_cert_fetch_cb (SSL *ssl, void *arg) {
         rd_kafka_transport_t *rktrans = rd_kafka_curr_transport;
         rd_kafka_broker_t *rkb;
         rd_kafka_t *rk;
         int r;
         int i;
         int ret;
-        int num_chain_certs;
+        rd_kafka_cert_fetch_cb_res_t cb_res;
+        rd_kafka_ssl_cert_fetch_cb_certs_t certs = RD_ZERO_INIT;
+        char  errstr[512];
+        rd_kafka_cert_t *leaf_cert = NULL;
+        rd_kafka_cert_t *pkey = NULL;
+        char *chain_certs_cur_ptr;
 
         rd_assert(rktrans != NULL);
         rkb = rktrans->rktrans_rkb;
         rk = rkb->rkb_rk;
+        *errstr = '\0';
 
-        rd_kafka_cert_fetch_cb_res_t cb_res;
-        size_t buf_size = 0; // start with zero to probe callback for correct size
-        char *buf = NULL;
-        char *leaf_cert_ptr;
-        char *pkey_ptr;
-        char *chain_cert_ptrs[16] = { 0 };
-        size_t leaf_cert_size;
-        size_t pkey_size;
-        size_t chain_cert_sizes[16] = { 0 };
-        rd_kafka_cert_enc_t format;
-
-        char errstr[512] = { 0 };
-        rd_kafka_cert_t *leaf_cert = NULL;
-        rd_kafka_cert_t *pkey = NULL;
-
-        do {
-                if (buf) rd_kafka_mem_free(rk, buf);
-                buf = rd_calloc(1, buf_size);
-                cb_res = rk->rk_conf.ssl.cert_fetch_cb(rk,rkb->rkb_nodename, rkb->rkb_nodeid,
-                                                       buf, &buf_size,
-                                                       &leaf_cert_ptr, &leaf_cert_size,
-                                                       &pkey_ptr, &pkey_size,
-                                                       chain_cert_ptrs, chain_cert_sizes,
-                                                       &format,
-                                                       rk->rk_conf.opaque);
-        } while (cb_res == RD_KAFKA_CERT_FETCH_MORE_BUFFER);
+        cb_res = rk->rk_conf.ssl.cert_fetch_cb(rk,
+                                               rkb->rkb_nodename,
+                                               rkb->rkb_nodeid,
+                                               &certs,
+                                               errstr, sizeof(errstr),
+                                               rk->rk_conf.opaque);
 
         if (cb_res == RD_KAFKA_CERT_FETCH_NONE) {
                 ret = 1;
                 goto out;
         } else if (cb_res == RD_KAFKA_CERT_FETCH_ERR) {
+                rd_rkb_log(rkb, LOG_ERR, "SSLCERTFETCH",
+                           "Certificate cert fetch callback failed: %s ",
+                           errstr);
                 ret = 0;
                 goto out;
         }
 
-        leaf_cert = rd_kafka_cert_new(&rk->rk_conf, RD_KAFKA_CERT_PUBLIC_KEY, format,
-                                      leaf_cert_ptr, leaf_cert_size, errstr, sizeof(errstr));
+        if (certs.leaf_cert == NULL) {
+                rd_rkb_log(rkb, LOG_ERR, "SSLCERTFETCH",
+                           "No leaf certificate provided");
+                ret = 0;
+                goto out;
+        }
+
+        leaf_cert = rd_kafka_cert_new(&rk->rk_conf, RD_KAFKA_CERT_PUBLIC_KEY,
+                                      certs.format, certs.leaf_cert,
+                                      certs.leaf_cert_len,
+                                      errstr, sizeof(errstr));
         if (!leaf_cert) {
                 rd_rkb_log(rkb, LOG_ERR, "SSLCERTFETCH",
-                           "Certificate fetch callback leaf cert parsing failed: %s", errstr);
+                           "Certificate fetch callback leaf cert parsing "
+                           "failed: %s", errstr);
                 ret = 0;
                 goto out;
         }
@@ -479,16 +491,26 @@ static int rd_kafka_transport_ssl_cert_fetch_cb(SSL *ssl, void *arg) {
         if (r != 1) {
                 rd_kafka_ssl_error(rk, rkb, errstr, sizeof(errstr));
                 rd_rkb_log(rkb, LOG_ERR, "SSLCERTFETCH",
-                           "Certificate fetch callback leaf cert loading failed: %s", errstr);
+                           "Certificate fetch callback leaf cert loading "
+                           "failed: %s", errstr);
                 ret = 0;
                 goto out;
         }
 
-        pkey = rd_kafka_cert_new(&rk->rk_conf, RD_KAFKA_CERT_PRIVATE_KEY, format,
-                                 pkey_ptr, pkey_size, errstr, sizeof(errstr));
+        if (certs.pkey == NULL) {
+                rd_rkb_log(rkb, LOG_ERR, "SSLCERTFETCH",
+                           "No private key provided");
+                ret = 0;
+                goto out;
+        }
+
+        pkey = rd_kafka_cert_new(&rk->rk_conf, RD_KAFKA_CERT_PRIVATE_KEY,
+                                 certs.format, certs.pkey, certs.pkey_len,
+                                 errstr, sizeof(errstr));
         if (!pkey) {
                 rd_rkb_log(rkb, LOG_ERR, "SSLCERTFETCH",
-                           "Certificate fetch callback private key parsing failed: %s", errstr);
+                           "Certificate fetch callback private key parsing "
+                           "failed: %s", errstr);
                 ret = 0;
                 goto out;
         }
@@ -497,21 +519,36 @@ static int rd_kafka_transport_ssl_cert_fetch_cb(SSL *ssl, void *arg) {
         if (r != 1) {
                 rd_kafka_ssl_error(rk, rkb, errstr, sizeof(errstr));
                 rd_rkb_log(rkb, LOG_ERR, "SSLCERTFETCH",
-                           "Certificate fetch callback private key loading failed: %s", errstr);
+                           "Certificate fetch callback private key loading "
+                           "failed: %s", errstr);
                 ret = 0;
                 goto out;
         }
 
-        num_chain_certs = sizeof(chain_cert_ptrs)/sizeof(chain_cert_ptrs[0]);
-        for (i = 0; i < num_chain_certs; i++) {
-                if (!chain_cert_ptrs[i]) continue;
+        if (certs.chain_certs_cnt > 0 && certs.chain_certs_buf == NULL) {
+                rd_rkb_log(rkb, LOG_ERR, "SSLCERTFETCH",
+                           "No intermediate cert buffer provided");
+                ret = 0;
+                goto out;
+        }
+        if (certs.chain_certs_cnt > 0 && certs.chain_cert_lens == NULL) {
+                rd_rkb_log(rkb, LOG_ERR, "SSLCERTFETCH",
+                           "No intermediate cert lengths provided");
+                ret = 0;
+                goto out;
+        }
 
-                rd_kafka_cert_t *chain_cert = rd_kafka_cert_new(&rk->rk_conf, RD_KAFKA_CERT_PUBLIC_KEY, format,
-                                                                chain_cert_ptrs[i], chain_cert_sizes[i],
-                                                                errstr, sizeof(errstr));
+        chain_certs_cur_ptr = certs.chain_certs_buf;
+        for (i = 0; i < certs.chain_certs_cnt; i++) {
+                rd_kafka_cert_t *chain_cert = rd_kafka_cert_new(
+                        &rk->rk_conf, RD_KAFKA_CERT_PUBLIC_KEY, certs.format,
+                        chain_certs_cur_ptr, certs.chain_cert_lens[i],
+                        errstr, sizeof(errstr));
+
                 if (!chain_cert) {
                         rd_rkb_log(rkb, LOG_ERR, "SSLCERTFETCH",
-                                   "Certificate fetch callback chain cert parsing failed: %s", errstr);
+                                   "Certificate fetch callback chain cert "
+                                   "parsing failed: %s", errstr);
                         ret = 0;
                         goto out;
                 }
@@ -520,16 +557,25 @@ static int rd_kafka_transport_ssl_cert_fetch_cb(SSL *ssl, void *arg) {
                 if (r != 1) {
                         rd_kafka_ssl_error(rk, rkb, errstr, sizeof(errstr));
                         rd_rkb_log(rkb, LOG_ERR, "SSLCERTFETCH",
-                                   "Certificate fetch callback chain cert loading failed: %s", errstr);
+                                   "Certificate fetch callback chain cert "
+                                   "loading failed: %s", errstr);
                         ret = 0;
                         goto out;
                 }
+                chain_certs_cur_ptr += certs.chain_cert_lens[i];
         }
 
         ret = 1;
 
 out:
-        if (buf) rd_kafka_mem_free(rkb->rkb_rk, buf);
+        if (certs.leaf_cert != NULL)
+                rd_free(certs.leaf_cert);
+        if (certs.pkey != NULL)
+                rd_free(certs.pkey);
+        if (certs.chain_certs_buf != NULL)
+                rd_free(certs.chain_certs_buf);
+        if (certs.chain_cert_lens != NULL)
+                rd_free(certs.chain_cert_lens);
         return ret;
 }
 #endif
@@ -728,6 +774,7 @@ int rd_kafka_transport_ssl_handshake (rd_kafka_transport_t *rktrans) {
                                                     errstr,
                                                     sizeof(errstr)) == -1) {
                 const char *extra = "";
+                rd_kafka_resp_err_t err = RD_KAFKA_RESP_ERR__SSL;
 
                 if (strstr(errstr, "unexpected message"))
                         extra = ": client SSL authentication might be "
@@ -751,10 +798,14 @@ int rd_kafka_transport_ssl_handshake (rd_kafka_transport_t *rktrans) {
                                 " (install ca-certificates package)"
 #endif
                                 ;
-                else if (!strcmp(errstr, "Disconnected"))
+                else if (!strcmp(errstr, "Disconnected")) {
                         extra = ": connecting to a PLAINTEXT broker listener?";
+                        /* Disconnects during handshake are most likely
+                         * not due to SSL, but rather at the transport level */
+                        err = RD_KAFKA_RESP_ERR__TRANSPORT;
+                }
 
-                rd_kafka_broker_fail(rkb, LOG_ERR, RD_KAFKA_RESP_ERR__SSL,
+                rd_kafka_broker_fail(rkb, LOG_ERR, err,
                                      "SSL handshake failed: %s%s", errstr,
                                      extra);
                 return -1;
@@ -1383,6 +1434,80 @@ static int rd_kafka_ssl_set_certs (rd_kafka_t *rk, SSL_CTX *ctx,
                 check_pkey = rd_true;
         }
 
+#if OPENSSL_VERSION_NUMBER >= 0x10100000
+        /*
+         * If applicable, use OpenSSL engine to fetch SSL certificate.
+         */
+        if (rk->rk_conf.ssl.engine) {
+                STACK_OF(X509_NAME) *cert_names = sk_X509_NAME_new_null();
+                STACK_OF(X509_OBJECT) *roots =
+                    X509_STORE_get0_objects(SSL_CTX_get_cert_store(ctx));
+                X509 *x509 = NULL;
+                EVP_PKEY *pkey = NULL;
+                int i = 0;
+                for (i = 0; i < sk_X509_OBJECT_num(roots); i++) {
+                        x509 = X509_OBJECT_get0_X509(sk_X509_OBJECT_value(roots,
+                                                                          i));
+
+                        if (x509)
+                                sk_X509_NAME_push(cert_names,
+                                                  X509_get_subject_name(x509));
+                }
+
+                if (cert_names)
+                        sk_X509_NAME_free(cert_names);
+
+                x509 = NULL;
+                r = ENGINE_load_ssl_client_cert(
+                        rk->rk_conf.ssl.engine, NULL,
+                        cert_names, &x509, &pkey,
+                        NULL, NULL,
+                        rk->rk_conf.ssl.engine_callback_data);
+
+                sk_X509_NAME_free(cert_names);
+                if (r == -1 || !x509 || !pkey) {
+                        X509_free(x509);
+                        EVP_PKEY_free(pkey);
+                        if (r == -1)
+                                rd_snprintf(errstr, errstr_size,
+                                            "OpenSSL "
+                                            "ENGINE_load_ssl_client_cert "
+                                            "failed: ");
+                        else if (!x509)
+                                rd_snprintf(errstr, errstr_size,
+                                            "OpenSSL engine failed to "
+                                            "load certificate: ");
+                        else
+                                rd_snprintf(errstr, errstr_size,
+                                            "OpenSSL engine failed to "
+                                            "load private key: ");
+
+                        return -1;
+                }
+
+                r = SSL_CTX_use_certificate(ctx, x509);
+                X509_free(x509);
+                if (r != 1) {
+                        rd_snprintf(errstr, errstr_size,
+                                    "Failed to use SSL_CTX_use_certificate "
+                                    "with engine: ");
+                        EVP_PKEY_free(pkey);
+                        return -1;
+                }
+
+                r = SSL_CTX_use_PrivateKey(ctx, pkey);
+                EVP_PKEY_free(pkey);
+                if (r != 1) {
+                        rd_snprintf(errstr, errstr_size,
+                                    "Failed to use SSL_CTX_use_PrivateKey "
+                                    "with engine: ");
+                        return -1;
+                }
+
+                check_pkey = rd_true;
+        }
+#endif
+
         /* Check that a valid private/public key combo was set. */
         if (check_pkey && SSL_CTX_check_private_key(ctx) != 1) {
                 rd_snprintf(errstr, errstr_size,
@@ -1404,7 +1529,81 @@ static int rd_kafka_ssl_set_certs (rd_kafka_t *rk, SSL_CTX *ctx,
 void rd_kafka_ssl_ctx_term (rd_kafka_t *rk) {
         SSL_CTX_free(rk->rk_conf.ssl.ctx);
         rk->rk_conf.ssl.ctx = NULL;
+
+#if OPENSSL_VERSION_NUMBER >= 0x10100000
+        RD_IF_FREE(rk->rk_conf.ssl.engine, ENGINE_free);
+#endif
 }
+
+
+#if OPENSSL_VERSION_NUMBER >= 0x10100000
+/**
+ * @brief Initialize and load OpenSSL engine, if configured.
+ *
+ * @returns true on success, false on error.
+ */
+static rd_bool_t rd_kafka_ssl_ctx_init_engine (rd_kafka_t *rk,
+                                               char *errstr,
+                                               size_t errstr_size) {
+        ENGINE *engine;
+
+        /* OpenSSL loads an engine as dynamic id and stores it in
+         * internal list, as per LIST_ADD command below. If engine
+         * already exists in internal list, it is supposed to be
+         * fetched using engine id.
+         */
+        engine = ENGINE_by_id(rk->rk_conf.ssl.engine_id);
+        if (!engine) {
+                engine = ENGINE_by_id("dynamic");
+                if (!engine) {
+                        rd_snprintf(errstr, errstr_size,
+                                    "OpenSSL engine initialization failed in"
+                                    " ENGINE_by_id: ");
+                        return rd_false;
+                }
+        }
+
+        if (!ENGINE_ctrl_cmd_string(engine, "SO_PATH",
+                                    rk->rk_conf.ssl.engine_location,
+                                    0)) {
+                ENGINE_free(engine);
+                rd_snprintf(errstr, errstr_size,
+                            "OpenSSL engine initialization failed in"
+                            " ENGINE_ctrl_cmd_string SO_PATH: ");
+                return rd_false;
+        }
+
+        if (!ENGINE_ctrl_cmd_string(engine, "LIST_ADD",
+                                    "1", 0)) {
+                ENGINE_free(engine);
+                rd_snprintf(errstr, errstr_size,
+                            "OpenSSL engine initialization failed in"
+                            " ENGINE_ctrl_cmd_string LIST_ADD: ");
+                return rd_false;
+        }
+
+        if (!ENGINE_ctrl_cmd_string(engine, "LOAD", NULL, 0)) {
+                ENGINE_free(engine);
+                rd_snprintf(errstr, errstr_size,
+                            "OpenSSL engine initialization failed in"
+                            " ENGINE_ctrl_cmd_string LOAD: ");
+                return rd_false;
+        }
+
+        if (!ENGINE_init(engine)) {
+                ENGINE_free(engine);
+                rd_snprintf(errstr, errstr_size,
+                            "OpenSSL engine initialization failed in"
+                            " ENGINE_init: ");
+                return rd_false;
+        }
+
+        rk->rk_conf.ssl.engine = engine;
+
+        return rd_true;
+}
+#endif
+
 
 /**
  * @brief Once per rd_kafka_t handle initialization of OpenSSL
@@ -1415,7 +1614,7 @@ void rd_kafka_ssl_ctx_term (rd_kafka_t *rk) {
  */
 int rd_kafka_ssl_ctx_init (rd_kafka_t *rk, char *errstr, size_t errstr_size) {
         int r;
-        SSL_CTX *ctx;
+        SSL_CTX *ctx = NULL;
         const char *linking =
 #if WITH_STATIC_LIB_libcrypto
                 "statically linked "
@@ -1440,10 +1639,24 @@ int rd_kafka_ssl_ctx_init (rd_kafka_t *rk, char *errstr, size_t errstr_size) {
         if (errstr_size > 0)
                 errstr[0] = '\0';
 
+#if OPENSSL_VERSION_NUMBER >= 0x10100000
+        if (rk->rk_conf.ssl.engine_location && !rk->rk_conf.ssl.engine) {
+                rd_kafka_dbg(rk, SECURITY, "SSL",
+                             "Loading OpenSSL engine from \"%s\"",
+                             rk->rk_conf.ssl.engine_location);
+                if (!rd_kafka_ssl_ctx_init_engine(rk, errstr, errstr_size))
+                        goto fail;
+        }
+#endif
+
+#if OPENSSL_VERSION_NUMBER >= 0x10100000
+        ctx = SSL_CTX_new(TLS_client_method());
+#else
         ctx = SSL_CTX_new(SSLv23_client_method());
+#endif
         if (!ctx) {
                 rd_snprintf(errstr, errstr_size,
-                            "SSLv23_client_method() failed: ");
+                            "SSL_CTX_new() failed: ");
                 goto fail;
         }
 
@@ -1480,9 +1693,10 @@ int rd_kafka_ssl_ctx_init (rd_kafka_t *rk, char *errstr, size_t errstr_size) {
                            rd_kafka_transport_ssl_cert_verify_cb : NULL);
 
 #if OPENSSL_VERSION_NUMBER >= 0x1000200fL && !defined(LIBRESSL_VERSION_NUMBER)
-        if (rk->rk_conf.ssl.cert_fetch_cb) {
-                SSL_CTX_set_cert_cb(ctx, rd_kafka_transport_ssl_cert_fetch_cb, NULL);
-        }
+        if (rk->rk_conf.ssl.cert_fetch_cb)
+                SSL_CTX_set_cert_cb(ctx,
+                                    rd_kafka_transport_ssl_cert_fetch_cb,
+                                    NULL);
 
         /* Curves */
         if (rk->rk_conf.ssl.curves_list) {
@@ -1526,7 +1740,10 @@ int rd_kafka_ssl_ctx_init (rd_kafka_t *rk, char *errstr, size_t errstr_size) {
         r = (int)strlen(errstr);
         rd_kafka_ssl_error(rk, NULL, errstr+r,
                            (int)errstr_size > r ? (int)errstr_size - r : 0);
-        SSL_CTX_free(ctx);
+        RD_IF_FREE(ctx, SSL_CTX_free);
+#if OPENSSL_VERSION_NUMBER >= 0x10100000
+        RD_IF_FREE(rk->rk_conf.ssl.engine, ENGINE_free);
+#endif
 
         return -1;
 }

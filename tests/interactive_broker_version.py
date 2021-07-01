@@ -13,7 +13,7 @@ from trivup.apps.KafkaBrokerApp import KafkaBrokerApp
 from trivup.apps.KerberosKdcApp import KerberosKdcApp
 from trivup.apps.SslApp import SslApp
 
-from cluster_testing import read_scenario_conf, create_selfsigned_cert, create_cert_via_intermediate
+from cluster_testing import read_scenario_conf
 
 import subprocess
 import time
@@ -122,26 +122,26 @@ def test_version (version, cmd=None, deploy=True, conf={}, debug=False, exec_cnt
             else:
                 cmd_env['RDK_SSL_{}'.format(k)] = v
 
-        # Also create some invalid certificates, that can be used by tests that want to ensure
-        # untrusted certs fail
-        selfsigned_key = create_selfsigned_cert(ssl, "librdkafka-untrusted")
-        for k, v in selfsigned_key.items():
-            if type(v) is dict:
-                for k2, v2 in v.items():
-                    # E.g. "RDK_UNTRUSTEDSSL_priv_der=path/to/librdkafka-priv.der"
-                    cmd_env['RDK_UNTRUSTEDSSL_{}_{}'.format(k, k2)] = v2
-            else:
-                cmd_env['RDK_UNTRUSTEDSSL_{}'.format(k)] = v
+            # Also create some invalid certificates, that can be used by tests that want to ensure
+            # untrusted certs fail
+            selfsigned_key = ssl.create_cert('librdkafka-untrusted', with_ca=False)
+            for k, v in selfsigned_key.items():
+                if type(v) is dict:
+                    for k2, v2 in v.items():
+                        # E.g. "RDK_UNTRUSTEDSSL_priv_der=path/to/librdkafka-priv.der"
+                        cmd_env['RDK_UNTRUSTEDSSL_{}_{}'.format(k, k2)] = v2
+                else:
+                    cmd_env['RDK_UNTRUSTEDSSL_{}'.format(k)] = v
 
-        # Also create some certificates signed via an intermediate
-        selfsigned_key = create_cert_via_intermediate(ssl, "librdkafka-via-intermediate")
-        for k, v in selfsigned_key.items():
-            if type(v) is dict:
-                for k2, v2 in v.items():
-                    # E.g. "RDK_INTERMEDIATESSL_priv_der=path/to/librdkafka-priv.der"
-                    cmd_env['RDK_INTERMEDIATESSL_{}_{}'.format(k, k2)] = v2
-            else:
-                cmd_env['RDK_INTERMEDIATESSL_{}'.format(k)] = v
+            # Also create some certificates signed via an intermediate
+            intermediate_key = ssl.create_cert('librdkafka-via-intermediate', through_intermediate=True)
+            for k, v in intermediate_key.items():
+                if type(v) is dict:
+                    for k2, v2 in v.items():
+                        # E.g. "RDK_INTERMEDIATESSL_priv_der=path/to/librdkafka-priv.der"
+                        cmd_env['RDK_INTERMEDIATESSL_{}_{}'.format(k, k2)] = v2
+                else:
+                    cmd_env['RDK_INTERMEDIATESSL_{}'.format(k)] = v
 
     # Define bootstrap brokers based on selected security protocol
     print('# Using client security.protocol=%s' % security_protocol)

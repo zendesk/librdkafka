@@ -50,7 +50,11 @@ static int allowed_error;
  */
 static int error_is_fatal_cb (rd_kafka_t *rk, rd_kafka_resp_err_t err,
                               const char *reason) {
-        if (err == allowed_error) {
+        if (err == allowed_error ||
+            /* If transport errors are allowed then it is likely
+             * that we'll also see ALL_BROKERS_DOWN. */
+            (allowed_error == RD_KAFKA_RESP_ERR__TRANSPORT &&
+             err == RD_KAFKA_RESP_ERR__ALL_BROKERS_DOWN)) {
                 TEST_SAY("Ignoring allowed error: %s: %s\n",
                          rd_kafka_err2name(err), reason);
                 return 0;
@@ -303,13 +307,8 @@ static void do_test_txn_recoverable_errors (void) {
 
 
 /**
- * @brief Test that fatal idempotence errors triggers abortable transaction
- *        errors and that the producer can recover.
- *
- * @remark Until KIP-360 is supported the idempotent fatal errors are also
- *         transactional fatal errors; thus this test-case is modified not to
- *         recover but instead raise a fatal error. Change it back to recovery
- *         tests when KIP-360 support is done.
+ * @brief KIP-360: Test that fatal idempotence errors triggers abortable
+ *        transaction errors and that the producer can recover.
  */
 static void do_test_txn_fatal_idempo_errors (void) {
         rd_kafka_t *rk;
@@ -362,15 +361,11 @@ static void do_test_txn_fatal_idempo_errors (void) {
         TEST_SAY("commit_transaction() failed (expectedly): %s\n",
                  rd_kafka_error_string(error));
 
-        TEST_ASSERT(rd_kafka_error_is_fatal(error),
-                    "Expected fatal error (pre-KIP360)");
-        TEST_ASSERT(!rd_kafka_error_is_retriable(error),
-                    "Did not expect retriable error");
-        TEST_ASSERT(!rd_kafka_error_txn_requires_abort(error),
-                    "Did not expect txn_requires_abort");
+        TEST_ASSERT(!rd_kafka_error_is_fatal(error),
+                    "Did not expect fatal error");
+        TEST_ASSERT(rd_kafka_error_txn_requires_abort(error),
+                    "Expected abortable error");
         rd_kafka_error_destroy(error);
-
-        goto prekip360_done;
 
         /* Abort the transaction */
         TEST_CALL_ERROR__(rd_kafka_abort_transaction(rk, -1));
@@ -387,7 +382,232 @@ static void do_test_txn_fatal_idempo_errors (void) {
 
         TEST_CALL_ERROR__(rd_kafka_commit_transaction(rk, -1));
 
- prekip360_done:
+        /* All done */
+
+        rd_kafka_destroy(rk);
+
+        allowed_error = RD_KAFKA_RESP_ERR_NO_ERROR;
+
+        SUB_TEST_PASS();
+}
+
+
+/**
+ * @brief KIP-360: Test that fatal idempotence errors triggers abortable
+ *        transaction errors, but let the broker-side bumping of the
+ *        producer PID take longer than the remaining transaction timeout
+ *        which should raise a retriable error from abort_transaction().
+ *
+ * @param with_sleep After the first abort sleep longer than it takes to
+ *                   re-init the pid so that the internal state automatically
+ *                   transitions.
+ */
+static void do_test_txn_slow_reinit (rd_bool_t with_sleep) {
+        rd_kafka_t *rk;
+        rd_kafka_mock_cluster_t *mcluster;
+        rd_kafka_error_t *error;
+        int32_t txn_coord = 2;
+        const char *txnid = "myTxnId";
+        test_timing_t timing;
+
+        SUB_TEST("%s sleep", with_sleep ? "with": "without");
+
+        rk = create_txn_producer(&mcluster, txnid, 3,
+                                 "batch.num.messages", "1",
+                                 NULL);
+
+        rd_kafka_mock_coordinator_set(mcluster, "transaction", txnid,
+                                      txn_coord);
+
+        test_curr->ignore_dr_err = rd_true;
+        test_curr->is_fatal_cb = NULL;
+
+        TEST_CALL_ERROR__(rd_kafka_init_transactions(rk, -1));
+
+        /*
+         * Start a transaction
+         */
+        TEST_CALL_ERROR__(rd_kafka_begin_transaction(rk));
+
+
+        /* Produce a message without error first */
+        TEST_CALL_ERR__(rd_kafka_producev(rk,
+                                          RD_KAFKA_V_TOPIC("mytopic"),
+                                          RD_KAFKA_V_PARTITION(0),
+                                          RD_KAFKA_V_VALUE("hi", 2),
+                                          RD_KAFKA_V_END));
+
+        test_flush(rk, -1);
+
+        /* Set transaction coordinator latency higher than
+         * the abort_transaction() call timeout so that the automatic
+         * re-initpid takes longer than abort_transaction(). */
+        rd_kafka_mock_broker_push_request_error_rtts(
+                mcluster,
+                txn_coord,
+                RD_KAFKAP_InitProducerId,
+                1,
+                RD_KAFKA_RESP_ERR_NO_ERROR, 10000/*10s*/);
+
+        /* Produce a message, let it fail with a fatal idempo error. */
+        rd_kafka_mock_push_request_errors(
+                mcluster,
+                RD_KAFKAP_Produce,
+                1,
+                RD_KAFKA_RESP_ERR_UNKNOWN_PRODUCER_ID);
+
+        TEST_CALL_ERR__(rd_kafka_producev(rk,
+                                          RD_KAFKA_V_TOPIC("mytopic"),
+                                          RD_KAFKA_V_PARTITION(0),
+                                          RD_KAFKA_V_VALUE("hi", 2),
+                                          RD_KAFKA_V_END));
+
+
+        /* Commit the transaction, should fail */
+        TIMING_START(&timing, "commit_transaction(-1)");
+        error = rd_kafka_commit_transaction(rk, -1);
+        TIMING_STOP(&timing);
+        TEST_ASSERT(error != NULL, "Expected commit_transaction() to fail");
+
+        TEST_SAY("commit_transaction() failed (expectedly): %s\n",
+                 rd_kafka_error_string(error));
+
+        TEST_ASSERT(!rd_kafka_error_is_fatal(error),
+                    "Did not expect fatal error");
+        TEST_ASSERT(rd_kafka_error_txn_requires_abort(error),
+                    "Expected abortable error");
+        rd_kafka_error_destroy(error);
+
+        /* Abort the transaction, should fail with retriable (timeout) error */
+        TIMING_START(&timing, "abort_transaction(100)");
+        error = rd_kafka_abort_transaction(rk, 100);
+        TIMING_STOP(&timing);
+        TEST_ASSERT(error != NULL, "Expected abort_transaction() to fail");
+
+        TEST_SAY("First abort_transaction() failed: %s\n",
+                 rd_kafka_error_string(error));
+        TEST_ASSERT(!rd_kafka_error_is_fatal(error),
+                    "Did not expect fatal error");
+        TEST_ASSERT(rd_kafka_error_is_retriable(error),
+                    "Expected retriable error");
+        rd_kafka_error_destroy(error);
+
+        if (with_sleep)
+                rd_sleep(12);
+
+        /* Retry abort, should now finish. */
+        TEST_SAY("Retrying abort\n");
+        TIMING_START(&timing, "abort_transaction(-1)");
+        TEST_CALL_ERROR__(rd_kafka_abort_transaction(rk, -1));
+        TIMING_STOP(&timing);
+
+        /* Run a new transaction without errors to verify that the
+         * producer can recover. */
+        TEST_CALL_ERROR__(rd_kafka_begin_transaction(rk));
+
+        TEST_CALL_ERR__(rd_kafka_producev(rk,
+                                          RD_KAFKA_V_TOPIC("mytopic"),
+                                          RD_KAFKA_V_PARTITION(0),
+                                          RD_KAFKA_V_VALUE("hi", 2),
+                                          RD_KAFKA_V_END));
+
+        TEST_CALL_ERROR__(rd_kafka_commit_transaction(rk, -1));
+
+        /* All done */
+
+        rd_kafka_destroy(rk);
+
+        allowed_error = RD_KAFKA_RESP_ERR_NO_ERROR;
+
+        SUB_TEST_PASS();
+}
+
+
+
+/**
+ * @brief KIP-360: Test that fatal idempotence errors triggers abortable
+ *        transaction errors, but let the broker-side bumping of the
+ *        producer PID fail with a fencing error.
+ *        Should raise a fatal error.
+ */
+static void do_test_txn_fenced_reinit (void) {
+        rd_kafka_t *rk;
+        rd_kafka_mock_cluster_t *mcluster;
+        rd_kafka_error_t *error;
+        int32_t txn_coord = 2;
+        const char *txnid = "myTxnId";
+        char errstr[512];
+        rd_kafka_resp_err_t fatal_err;
+
+        SUB_TEST_QUICK();
+
+        rk = create_txn_producer(&mcluster, txnid, 3,
+                                 "batch.num.messages", "1",
+                                 NULL);
+
+        rd_kafka_mock_coordinator_set(mcluster, "transaction", txnid,
+                                      txn_coord);
+
+        test_curr->ignore_dr_err = rd_true;
+        test_curr->is_fatal_cb = error_is_fatal_cb;
+        allowed_error = RD_KAFKA_RESP_ERR__FENCED;
+
+        TEST_CALL_ERROR__(rd_kafka_init_transactions(rk, -1));
+
+        /*
+         * Start a transaction
+         */
+        TEST_CALL_ERROR__(rd_kafka_begin_transaction(rk));
+
+
+        /* Produce a message without error first */
+        TEST_CALL_ERR__(rd_kafka_producev(rk,
+                                          RD_KAFKA_V_TOPIC("mytopic"),
+                                          RD_KAFKA_V_PARTITION(0),
+                                          RD_KAFKA_V_VALUE("hi", 2),
+                                          RD_KAFKA_V_END));
+
+        test_flush(rk, -1);
+
+        /* Fail the PID reinit */
+        rd_kafka_mock_broker_push_request_error_rtts(
+                mcluster,
+                txn_coord,
+                RD_KAFKAP_InitProducerId,
+                1,
+                RD_KAFKA_RESP_ERR_INVALID_PRODUCER_EPOCH, 0);
+
+        /* Produce a message, let it fail with a fatal idempo error. */
+        rd_kafka_mock_push_request_errors(
+                mcluster,
+                RD_KAFKAP_Produce,
+                1,
+                RD_KAFKA_RESP_ERR_UNKNOWN_PRODUCER_ID);
+
+        TEST_CALL_ERR__(rd_kafka_producev(rk,
+                                          RD_KAFKA_V_TOPIC("mytopic"),
+                                          RD_KAFKA_V_PARTITION(0),
+                                          RD_KAFKA_V_VALUE("hi", 2),
+                                          RD_KAFKA_V_END));
+
+        test_flush(rk, -1);
+
+        /* Abort the transaction, should fail with a fatal error */
+        error = rd_kafka_abort_transaction(rk, -1);
+        TEST_ASSERT(error != NULL, "Expected abort_transaction() to fail");
+
+        TEST_SAY("abort_transaction() failed: %s\n",
+                 rd_kafka_error_string(error));
+        TEST_ASSERT(rd_kafka_error_is_fatal(error),
+                    "Expected a fatal error");
+        rd_kafka_error_destroy(error);
+
+        fatal_err = rd_kafka_fatal_error(rk, errstr, sizeof(errstr));
+        TEST_ASSERT(fatal_err,
+                    "Expected a fatal error to have been raised");
+        TEST_SAY("Fatal error: %s: %s\n",
+                 rd_kafka_err2name(fatal_err), errstr);
+
         /* All done */
 
         rd_kafka_destroy(rk);
@@ -526,6 +746,7 @@ static void do_test_txn_endtxn_errors (void) {
                         rd_kafka_topic_partition_list_t *offsets;
                         rd_kafka_consumer_group_metadata_t *cgmetadata;
                         rd_kafka_error_t *error;
+                        test_timing_t t_call;
 
                         TEST_SAY("Testing scenario #%d %s with %"PRIusz
                                  " injected erorrs, expecting %s\n",
@@ -592,10 +813,14 @@ static void do_test_txn_endtxn_errors (void) {
                                 scenario[i].error_cnt,
                                 scenario[i].errors);
 
+                        TIMING_START(&t_call, "%s", commit_str);
                         if (commit)
-                                error = rd_kafka_commit_transaction(rk, 5000);
+                                error = rd_kafka_commit_transaction(
+                                        rk, tmout_multip(5000));
                         else
-                                error = rd_kafka_abort_transaction(rk, 5000);
+                                error = rd_kafka_abort_transaction(
+                                        rk, tmout_multip(5000));
+                        TIMING_STOP(&t_call);
 
                         if (error)
                                 TEST_SAY("Scenario #%d %s failed: %s: %s "
@@ -2244,6 +2469,94 @@ static void do_test_unstable_offset_commit (void) {
 }
 
 
+/**
+ * @brief If a message times out locally before being attempted to send
+ *        and commit_transaction() is called, the transaction must not succeed.
+ *        https://github.com/confluentinc/confluent-kafka-dotnet/issues/1568
+ */
+static void do_test_commit_after_msg_timeout (void) {
+        rd_kafka_t *rk;
+        rd_kafka_mock_cluster_t *mcluster;
+        int32_t coord_id, leader_id;
+        rd_kafka_resp_err_t err;
+        rd_kafka_error_t *error;
+        const char *topic = "test";
+        const char *transactional_id = "txnid";
+        int remains = 0;
+
+        SUB_TEST_QUICK();
+
+        /* Assign coordinator and leader to two different brokers */
+        coord_id = 1;
+        leader_id = 2;
+
+        rk = create_txn_producer(&mcluster, transactional_id, 3,
+                                 "message.timeout.ms", "5000",
+                                 "transaction.timeout.ms", "10000",
+                                 NULL);
+
+        /* Broker down is not a test-failing error */
+        allowed_error = RD_KAFKA_RESP_ERR__TRANSPORT;
+        test_curr->is_fatal_cb = error_is_fatal_cb;
+        test_curr->exp_dr_err = RD_KAFKA_RESP_ERR__MSG_TIMED_OUT;
+
+        err = rd_kafka_mock_topic_create(mcluster, topic, 1, 3);
+        TEST_ASSERT(!err, "Failed to create topic: %s", rd_kafka_err2str (err));
+
+        rd_kafka_mock_coordinator_set(mcluster, "transaction", transactional_id,
+                                      coord_id);
+        rd_kafka_mock_partition_set_leader(mcluster, topic, 0, leader_id);
+
+        /* Start transactioning */
+        TEST_SAY("Starting transaction\n");
+        TEST_CALL_ERROR__(rd_kafka_init_transactions(rk, -1));
+
+        TEST_CALL_ERROR__(rd_kafka_begin_transaction(rk));
+
+        TEST_SAY("Bringing down %"PRId32"\n", leader_id);
+        rd_kafka_mock_broker_set_down(mcluster, leader_id);
+        rd_kafka_mock_broker_set_down(mcluster, coord_id);
+
+        test_produce_msgs2_nowait(rk, topic, 0, 0, 0, 1, NULL, 0, &remains);
+
+        error = rd_kafka_commit_transaction(rk, -1);
+        TEST_ASSERT(error != NULL, "expected commit_transaciton() to fail");
+        TEST_SAY("commit_transaction() failed (as expected): %s\n",
+                 rd_kafka_error_string(error));
+        TEST_ASSERT(rd_kafka_error_txn_requires_abort (error),
+                    "Expected txn_requires_abort error");
+        rd_kafka_error_destroy(error);
+
+        /* Bring the brokers up so the abort can complete */
+        rd_kafka_mock_broker_set_up(mcluster, coord_id);
+        rd_kafka_mock_broker_set_up(mcluster, leader_id);
+
+        TEST_SAY("Aborting transaction\n");
+        TEST_CALL_ERROR__(rd_kafka_abort_transaction(rk, -1));
+
+        TEST_ASSERT(remains == 0,
+                    "%d message(s) were not flushed\n", remains);
+
+        TEST_SAY("Attempting second transaction, which should succeed\n");
+        allowed_error = RD_KAFKA_RESP_ERR_NO_ERROR;
+        test_curr->is_fatal_cb = error_is_fatal_cb;
+        test_curr->exp_dr_err = RD_KAFKA_RESP_ERR_NO_ERROR;
+
+        TEST_CALL_ERROR__(rd_kafka_begin_transaction(rk));
+        test_produce_msgs2_nowait(rk, topic, 0, 0, 0, 1, NULL, 0, &remains);
+
+        TEST_CALL_ERROR__(rd_kafka_commit_transaction(rk, -1));
+
+        TEST_ASSERT(remains == 0,
+                    "%d message(s) were not produced\n", remains);
+
+        rd_kafka_destroy(rk);
+
+        test_curr->is_fatal_cb = NULL;
+
+        SUB_TEST_PASS();
+}
+
 int main_0105_transactions_mock (int argc, char **argv) {
         if (test_needs_auth()) {
                 TEST_SKIP("Mock cluster does not support SSL/SASL\n");
@@ -2254,6 +2567,19 @@ int main_0105_transactions_mock (int argc, char **argv) {
 
         do_test_txn_fatal_idempo_errors();
 
+        do_test_txn_fenced_reinit();
+
+        do_test_txn_req_cnt();
+
+        do_test_txn_requires_abort_errors();
+
+        do_test_txn_slow_reinit(rd_false);
+        do_test_txn_slow_reinit(rd_true);
+
+        /* Just do a subset of tests in quick mode */
+        if (test_quick)
+                return 0;
+
         do_test_txn_endtxn_errors();
 
         do_test_txn_endtxn_infinite();
@@ -2262,10 +2588,6 @@ int main_0105_transactions_mock (int argc, char **argv) {
          * until they're properly handled by the producer. */
         if (0)
                 do_test_txn_endtxn_timeout();
-
-        do_test_txn_req_cnt();
-
-        do_test_txn_requires_abort_errors();
 
         /* Bring down the coordinator */
         do_test_txn_broker_down_in_txn(rd_true);
@@ -2297,8 +2619,9 @@ int main_0105_transactions_mock (int argc, char **argv) {
 
         do_test_unstable_offset_commit();
 
-        if (!test_quick)
-                do_test_txn_switch_coordinator();
+        do_test_commit_after_msg_timeout();
+
+        do_test_txn_switch_coordinator();
 
         return 0;
 }

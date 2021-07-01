@@ -186,6 +186,24 @@ static void rd_kafka_toppar_consumer_lag_tmr_cb (rd_kafka_timers_t *rkts,
 	rd_kafka_toppar_consumer_lag_req(rktp);
 }
 
+/**
+ * @brief Update rktp_op_version.
+ *        Enqueue an RD_KAFKA_OP_BARRIER type of operation
+ *        when the op_version is updated.
+ *
+ * @locks_required rd_kafka_toppar_lock() must be held.
+ * @locality Toppar handler thread
+ */
+void rd_kafka_toppar_op_version_bump (rd_kafka_toppar_t *rktp,
+                                      int32_t version) {
+        rd_kafka_op_t *rko;
+
+        rktp->rktp_op_version = version;
+        rko = rd_kafka_op_new(RD_KAFKA_OP_BARRIER);
+        rko->rko_version = version;
+        rd_kafka_q_enq(rktp->rktp_fetchq, rko);
+}
+
 
 /**
  * Add new partition to topic.
@@ -691,7 +709,7 @@ void rd_kafka_toppar_enq_msg (rd_kafka_toppar_t *rktp, rd_kafka_msg_t *rkm) {
         rd_kafka_toppar_unlock(rktp);
 
         if (wakeup_q) {
-                rd_kafka_q_yield(wakeup_q, rd_true/*rate-limit*/);
+                rd_kafka_q_yield(wakeup_q);
                 rd_kafka_q_destroy(wakeup_q);
         }
 }
@@ -958,7 +976,7 @@ void rd_kafka_toppar_insert_msgq (rd_kafka_toppar_t *rktp,
  * Helper method for purging queues when removing a toppar.
  * Locks: rd_kafka_toppar_lock() MUST be held
  */
-void rd_kafka_toppar_purge_queues (rd_kafka_toppar_t *rktp) {
+void rd_kafka_toppar_purge_and_disable_queues (rd_kafka_toppar_t *rktp) {
         rd_kafka_q_disable(rktp->rktp_fetchq);
         rd_kafka_q_purge(rktp->rktp_fetchq);
         rd_kafka_q_disable(rktp->rktp_ops);
@@ -1585,7 +1603,7 @@ static void rd_kafka_toppar_fetch_start (rd_kafka_toppar_t *rktp,
                 goto err_reply;
         }
 
-	rktp->rktp_op_version = version;
+        rd_kafka_toppar_op_version_bump(rktp, version);
 
         if (rkcg) {
                 rd_kafka_assert(rktp->rktp_rkt->rkt_rk, !rktp->rktp_cgrp);
@@ -1694,7 +1712,7 @@ void rd_kafka_toppar_fetch_stop (rd_kafka_toppar_t *rktp,
                      rktp->rktp_partition,
                      rd_kafka_fetch_states[rktp->rktp_fetch_state], version);
 
-	rktp->rktp_op_version = version;
+        rd_kafka_toppar_op_version_bump(rktp, version);
 
 	/* Abort pending offset lookups. */
 	if (rktp->rktp_fetch_state == RD_KAFKA_TOPPAR_FETCH_OFFSET_QUERY)
@@ -1754,7 +1772,7 @@ void rd_kafka_toppar_seek (rd_kafka_toppar_t *rktp,
 		goto err_reply;
 	}
 
-	rktp->rktp_op_version = version;
+        rd_kafka_toppar_op_version_bump(rktp, version);
 
 	/* Abort pending offset lookups. */
 	if (rktp->rktp_fetch_state == RD_KAFKA_TOPPAR_FETCH_OFFSET_QUERY)
@@ -1809,7 +1827,7 @@ static void rd_kafka_toppar_pause_resume (rd_kafka_toppar_t *rktp,
 
 	rd_kafka_toppar_lock(rktp);
 
-	rktp->rktp_op_version = version;
+        rd_kafka_toppar_op_version_bump(rktp, version);
 
         if (!pause && (rktp->rktp_flags & flag) != flag) {
                 rd_kafka_dbg(rk, TOPIC, "RESUME",
@@ -3589,6 +3607,8 @@ rd_kafka_topic_partition_list_query_leaders_async_worker (rd_kafka_op_t *rko) {
         if (!rd_kafka_timer_is_started(&rk->rk_timers,
                                        &rko->rko_u.leaders.query_tmr)) {
 
+                rko->rko_u.leaders.query_cnt++;
+
                 /* Add query interval timer. */
                 rd_kafka_enq_once_add_source(rko->rko_u.leaders.eonce,
                                              "query timer");
@@ -3608,7 +3628,6 @@ rd_kafka_topic_partition_list_query_leaders_async_worker (rd_kafka_op_t *rko) {
                         rd_false/*!cgrp_update*/,
                         "query partition leaders");
 
-                rko->rko_u.leaders.query_cnt++;
         }
 
         rd_list_destroy(leaders);
@@ -4239,28 +4258,44 @@ int rd_kafka_toppar_pid_change (rd_kafka_toppar_t *rktp, rd_kafka_pid_t pid,
  *        Delivery reports will be enqueued for all purged messages, the error
  *        code is set to RD_KAFKA_RESP_ERR__PURGE_QUEUE.
  *
- * @warning Only to be used with the producer
+ * @param include_xmit_msgq If executing from the rktp's current broker handler
+ *                          thread, also include the xmit message queue.
+ *
+ * @warning Only to be used with the producer.
  *
  * @returns the number of messages purged
  *
- * @locality toppar handler thread
- * @locks none
+ * @locality any thread.
+ * @locks_acquired rd_kafka_toppar_lock()
+ * @locks_required none
  */
-int rd_kafka_toppar_handle_purge_queues (rd_kafka_toppar_t *rktp,
-                                         rd_kafka_broker_t *rkb,
-                                         int purge_flags) {
+int rd_kafka_toppar_purge_queues (rd_kafka_toppar_t *rktp,
+                                  int purge_flags,
+                                  rd_bool_t include_xmit_msgq) {
+        rd_kafka_t *rk = rktp->rktp_rkt->rkt_rk;
         rd_kafka_msgq_t rkmq = RD_KAFKA_MSGQ_INITIALIZER(rkmq);
         int cnt;
 
-        rd_assert(rkb->rkb_rk->rk_type == RD_KAFKA_PRODUCER);
-        rd_assert(thrd_is_current(rkb->rkb_thread));
+        rd_assert(rk->rk_type == RD_KAFKA_PRODUCER);
+
+        rd_kafka_dbg(rk, TOPIC, "PURGE",
+                     "%s [%"PRId32"]: purging queues "
+                     "(purge_flags 0x%x, %s xmit_msgq)",
+                     rktp->rktp_rkt->rkt_topic->str,
+                     rktp->rktp_partition,
+                     purge_flags,
+                     include_xmit_msgq ? "include" : "exclude");
 
         if (!(purge_flags & RD_KAFKA_PURGE_F_QUEUE))
                 return 0;
 
-        /* xmit_msgq is owned by the toppar handler thread (broker thread)
-         * and requires no locking. */
-        rd_kafka_msgq_concat(&rkmq, &rktp->rktp_xmit_msgq);
+        if (include_xmit_msgq) {
+                /* xmit_msgq is owned by the toppar handler thread
+                 * (broker thread) and requires no locking. */
+                rd_assert(rktp->rktp_broker);
+                rd_assert(thrd_is_current(rktp->rktp_broker->rkb_thread));
+                rd_kafka_msgq_concat(&rkmq, &rktp->rktp_xmit_msgq);
+        }
 
         rd_kafka_toppar_lock(rktp);
         rd_kafka_msgq_concat(&rkmq, &rktp->rktp_msgq);
@@ -4272,7 +4307,7 @@ int rd_kafka_toppar_handle_purge_queues (rd_kafka_toppar_t *rktp,
                  * will not be produced (retried) we need to adjust the
                  * idempotence epoch's base msgid to skip the messages. */
                 rktp->rktp_eos.epoch_base_msgid += cnt;
-                rd_kafka_dbg(rktp->rktp_rkt->rkt_rk,
+                rd_kafka_dbg(rk,
                              TOPIC|RD_KAFKA_DBG_EOS, "ADVBASE",
                              "%.*s [%"PRId32"] "
                              "advancing epoch base msgid to %"PRIu64

@@ -19,6 +19,10 @@ COMPAT_KAFKA_VERSIONS?=0.8.2.2 0.9.0.1 0.11.0.3 1.0.2 2.4.1 $(KAFKA_VERSION)
 # Non-default scenarios (FIXME: read from scenarios/*)
 SCENARIOS?=noautocreate ak23
 
+# A subset of rudimentary (and quick) tests suitable for quick smoke testing.
+# The smoke test should preferably finish in under a minute.
+SMOKE_TESTS?=0000,0001,0004,0012,0017,0022,0030,0039,0049,0087,0103
+
 -include ../Makefile.config
 
 # Use C++ compiler as linker
@@ -37,10 +41,6 @@ broker: $(BIN)
 broker_idempotent: $(BIN)
 	./broker_version_tests.py --conf '{"parallel":1, "args":"-P -L -Q"}' $(KAFKA_VERSION)
 
-non_sparse_connections: $(BIN)
-	./broker_version_tests.py --brokers 5 \
-		--conf '{"parallel":1, "args": "-L -Q", "sparse_connections": "false"}' $(KAFKA_VERSION)
-
 sasl: $(BIN)
 	./sasl_test.py --conf '{"parallel":1, "args":"-L -Q"}' $(KAFKA_VERSION)
 
@@ -54,6 +54,10 @@ full: broker broker_idempotent sasl
 quick:
 	@echo "Running quick(er) test suite (without sockem)"
 	./run-test.sh -Q -E
+
+smoke:
+	@echo "Running smoke tests: $(SMOKE_TESTS)"
+	TESTS="$(SMOKE_TESTS)" $(MAKE) quick
 
 run_par: $(BIN)
 	@echo "Running tests in parallel"
@@ -123,9 +127,9 @@ clean:
 	rm -f *.test $(OBJS) $(BIN)
 	$(MAKE) -C interceptor_test clean
 
+# Remove test reports, temporary test files, crash dumps, etc.
 clean-output:
-	# Clean test output files
-	rm -f stats_*.json *.offset
+	rm -f *.offset stats_*.json core vgcore.* _until_fail_*.log gdbrun??????
 
 realclean: clean clean-output
 	rm -f test_report_*.json
@@ -173,8 +177,6 @@ release-test: | asan tsan pristine-full scenarios compat
 rusage:
 	./run-test.sh -R bare
 
-# Remove test reports, temporary test files, crash dumps, etc.
-clean-reports:
-	rm -f *.offset stats_*.json core vgcore.*
+
 
 -include $(DEPS)

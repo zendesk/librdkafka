@@ -158,7 +158,7 @@ typedef SSIZE_T ssize_t;
  * @remark This value should only be used during compile time,
  *         for runtime checks of version use rd_kafka_version()
  */
-#define RD_KAFKA_VERSION  0x010601ff
+#define RD_KAFKA_VERSION  0x010700ff
 
 /**
  * @brief Returns the librdkafka version as integer.
@@ -2250,10 +2250,9 @@ rd_kafka_conf_res_t rd_kafka_conf_set_ssl_cert_verify_cb (
  * @sa rd_kafka_conf_set_ssl_cert_fetch_cb
  */
 typedef enum rd_kafka_cert_fetch_cb_res_t {
-    RD_KAFKA_CERT_FETCH_OK,             /**< Certificate & key written to buffers */
+    RD_KAFKA_CERT_FETCH_OK,             /**< Certificate & key written */
     RD_KAFKA_CERT_FETCH_NONE,           /**< No certificate & key required */
     RD_KAFKA_CERT_FETCH_ERR,            /**< Error loading certificate/key */
-    RD_KAFKA_CERT_FETCH_MORE_BUFFER,    /**< Must be called again with larger buffer */
     RD_KAFKA_CERT_FETCH__CNT
 } rd_kafka_cert_fetch_cb_res_t;
 
@@ -2287,6 +2286,24 @@ typedef enum rd_kafka_cert_enc_t {
 
 
 /**
+ * @struct rd_kafka_ssl_cert_fetch_cb_certs_t
+ *
+ * @brief Structure to be filled in by SSL client certificate callback
+ *
+ * @sa rd_kafka_conf_set_ssl_cert_fetch_cb
+ */
+typedef struct rd_kafka_ssl_cert_fetch_cb_certs_t {
+        char        *leaf_cert;         /**< Leaf certificate data */
+        size_t      leaf_cert_len;      /**< Size of leaf certificate data */
+        int         chain_certs_cnt;    /**< Number of intermediate certs  */
+        char        *chain_certs_buf;   /**< Int. certs concatenated together */
+        size_t      *chain_cert_lens;   /**< Len of each intermediate cert */
+        char        *pkey;              /**< Private key data */
+        size_t      pkey_len;           /**< Size of private key data */
+        rd_kafka_cert_enc_t format;     /**< Format for data in this struct */
+} rd_kafka_ssl_cert_fetch_cb_certs_t;
+
+/**
  * @brief Sets a callback that provides a client certificate
  *
  * This callback, if set, is triggered from internal librdkafka threads
@@ -2294,32 +2311,45 @@ typedef enum rd_kafka_cert_enc_t {
  * this is used in preference to any value set with the `ssl.key.` and
  * `ssl.certificate.` family of options.
  *
- * The pointers *certificate_buf_size and *key_buf_size initially contain the
- * maximum amount of bytes that can be written to *certificate_buf and *key_buf;
- * the callback is expected to overwrite these values with the actual length of
- * the certificate/key data it wrote (which should be no larger than the initial
- * value of the buffer size)
+ * The callback is passed a rd_kafka_ssl_cert_fetch_cb_certs_t structure to
+ * fill out. All fields of this structure are guaranteed to be initially set
+ * to zero. A correct implementation of this callback should:
+ *   - Fill in \c format with the format of certificate encoding that will be
+ *     provided by the callback (i.e. PKCS12, PEM, or DER).
+ *   - Fill in \c leaf_cert with a buffer allocated by \c rd_kafka_mem_malloc
+ *     and fill this buffer with the encoded leaf certificate.
+ *   - Fill in \c leaf_cert_len with the size of the leaf certificate
+ *   - Fill in \c pkey with a buffer allocated by \c rd_kafka_mem_malloc and
+ *     fill this buffer with the encoded private key corresponding to the
+ *     leaf certificate
+ *   - Fill in \c pkey_len with the size of this private key
  *
- * If the callback is able to provide a client certificate/key to librdkafka,
- * it should:
- *   - Return RD_KAFKA_CERT_FETCH_OK,
- *   - write a certificate to certificate_buf,
- *   - write the format of that certificate to certificate_format,m
- *   - write the size of the certificate to certificate_buf_size,
- *   - write a key to key_buf,
- *   - write the format of that key to key_format
- *   - write the size of the key to key_buf_size,
+ * The callback can also supply intermediate certificates to be sent to the
+ * broker along with the leaf certificate. To do this, the callback should
+ * additionally:
+ *   - Fill in \c chain_cert_buf with a single buffer allocated by
+ *     \c rd_kafka_mem_malloc to hold intermediate certificates. Intermediate
+ *     certificates should be written to this buffer one after the other with
+ *     no padding.
+ *   - Fill in \c chain_certs_cnt with the number of intermediate certs written
+ *     to the \c chain_cert_buf
+ *   - Fill in \c chain_cert_lens with an array of length \c chain_certs_cnt
+ *     allocated by \c rd_kafka_mem_malloc. Each element in this array should
+ *     be the length of the nth certificate in \c chain_cert_buf
  *
- * Otherwise, if the provided buffers are too small (i.e *certificate_buf_size
- * or *key_buf_size are too small), then the callback should:
- *   - Return RD_KAFKA_CERT_FETCH_MORE_BUFFER,
- *   - write the desired buffer size to *buf_size
- * Note that the first time rd_kafka_conf_set_ssl_cert_fetch_cb is called, it is
- * called with zero for *buf_size - i.e. you will always need to initially tell
- * librdkafka how large your buffer needs to be.
+ * The callback should return:
+ *   - \c RD_KAFKA_CERT_FETCH_OK if the SSL client cert structure was filled
+ *     successfully,
+ *   - \c RD_KAFKA_CERT_FETCH_NONE if the structure was not filled out because
+ *     no client certificate is requried to connect to this broker,
+ *   - \c RD_KAFKA_CERT_FETCH_ERR if the callback could not complete its work
+ *     due to an error. In this case, the callback should write an error
+ *     message to \c errstr (limited to \c errstr_size bytes, including
+ *     nul-term)
  *
- * If the callback is not able to provide a cert/key pair, it should simply
- * return RD_KAFKA_CERT_FETCH_NONE.
+ * All buffers assigned to the \c certsp struct become owned by librdkafka and
+ * librdkafka is itself responsible for freeing them when they are no longer
+ * required.
  *
  * @returns RD_KAFKA_CONF_OK if SSL is supported in this build, else
  *          RD_KAFKA_CONF_INVALID.
@@ -2329,15 +2359,12 @@ typedef enum rd_kafka_cert_enc_t {
 RD_EXPORT
 rd_kafka_conf_res_t rd_kafka_conf_set_ssl_cert_fetch_cb(
         rd_kafka_conf_t *conf,
-        int (*ssl_cert_fetch_cb) (rd_kafka_t *rk,
-                                  const char *broker_name,
-                                  int32_t broker_id,
-                                  char *buf, size_t *buf_size,
-                                  char **leaf_cert, size_t *leaf_cert_size,
-                                  char **pkey, size_t *pkey_size,
-                                  char *chain_certs[16], size_t chain_cert_sizes[16],
-                                  rd_kafka_cert_enc_t *format,
-                                  void *opaque));
+        rd_kafka_cert_fetch_cb_res_t (*ssl_cert_fetch_cb) (rd_kafka_t *rk,
+                                                           const char *broker_name,
+                                                           int32_t broker_id,
+                                                           rd_kafka_ssl_cert_fetch_cb_certs_t *certsp,
+                                                           char *errstr, size_t errstr_size,
+                                                           void *opaque));
 
 
 /**
@@ -2377,6 +2404,25 @@ rd_kafka_conf_set_ssl_cert (rd_kafka_conf_t *conf,
                             rd_kafka_cert_enc_t cert_enc,
                             const void *buffer, size_t size,
                             char *errstr, size_t errstr_size);
+
+
+/**
+ * @brief Set callback_data for OpenSSL engine.
+ *
+ * @param conf Configuration object.
+ * @param callback_data passed to engine callbacks, 
+ *                      e.g. \c ENGINE_load_ssl_client_cert.
+ *
+ * @remark The \c ssl.engine.location configuration must be set for this 
+ *         to have affect.
+ *
+ * @remark The memory pointed to by \p value must remain valid for the 
+ *         lifetime of the configuration object and any Kafka clients that 
+ *         use it.
+ */
+RD_EXPORT
+void rd_kafka_conf_set_engine_callback_data (rd_kafka_conf_t *conf, 
+                                             void *callback_data);
 
 
 /**
@@ -3161,6 +3207,44 @@ rd_kafka_offsets_for_times (rd_kafka_t *rk,
                             int timeout_ms);
 
 
+
+
+/**
+ * @brief Allocate and zero memory using the same allocator librdkafka uses.
+ *
+ * This is typically an abstraction for the calloc(3) call and makes sure
+ * the application can use the same memory allocator as librdkafka for
+ * allocating pointers that are used by librdkafka.
+ *
+ * \p rk can be set to return memory allocated by a specific \c rk instance
+ * otherwise pass NULL for \p rk.
+ *
+ * @remark Memory allocated by rd_kafka_mem_calloc() must be freed using
+ *         rd_kafka_mem_free()
+ */
+RD_EXPORT
+void *rd_kafka_mem_calloc (rd_kafka_t *rk, size_t num, size_t size);
+
+
+
+/**
+ * @brief Allocate memory using the same allocator librdkafka uses.
+ *
+ * This is typically an abstraction for the malloc(3) call and makes sure
+ * the application can use the same memory allocator as librdkafka for
+ * allocating pointers that are used by librdkafka.
+ *
+ * \p rk can be set to return memory allocated by a specific \c rk instance
+ * otherwise pass NULL for \p rk.
+ *
+ * @remark Memory allocated by rd_kafka_mem_malloc() must be freed using
+ *         rd_kafka_mem_free()
+ */
+RD_EXPORT
+void *rd_kafka_mem_malloc (rd_kafka_t *rk, size_t size);
+
+
+
 /**
  * @brief Free pointer returned by librdkafka
  *
@@ -3169,7 +3253,7 @@ rd_kafka_offsets_for_times (rd_kafka_t *rk,
  * freeing pointers returned by librdkafka.
  *
  * In standard setups it is usually not necessary to use this interface
- * rather than the free(3) functione.
+ * rather than the free(3) function.
  *
  * \p rk must be set for memory returned by APIs that take an \c rk argument,
  * for other APIs pass NULL for \p rk.
