@@ -1,0 +1,31 @@
+#!/bin/bash
+#
+# usdt support
+#
+# Usage:
+#   mkl_require usdt
+#
+# And then call the following function from the correct place/order in checks:
+#   mkl_check usdt
+#
+
+
+mkl_toggle_option "Feature" ENABLE_USDT "--enable-usdt" "Enable support for USDT probes on Linux" "n"
+
+function manual_checks {
+    case "$ENABLE_USDT" in
+        n) return 0 ;;
+        y) local action=fail ;;
+        try) local action=disable ;;
+        *) mkl_err "mklove internal error: invalid value for ENABLE_USDT: $ENABLE_USDT"; exit 1 ;;
+    esac
+
+    mkl_lib_check "usdt" "WITH_USDT" $action CC "" \
+                  "
+#include <sys/sdt.h>
+
+void foo (void) {
+        DTRACE_PROBE1(librdkafka, usdt_check, 0);
+}
+"
+}

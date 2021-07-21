@@ -372,6 +372,7 @@ rd_kafka_op_t *rd_kafka_q_pop_serve (rd_kafka_q_t *rkq, rd_ts_t timeout_us,
                         rd_kafka_q_mark_served(rkq);
 
                         if (rko) {
+                                RD_TRACE4(librdkafka, rd_kafka_q_pop_serve_serving, rkq, rkq->rkq_qlen, rkq->rkq_qsize, rko);
                                 /* Proper versioned op */
                                 rd_kafka_q_deq0(rkq, rko);
 
@@ -490,6 +491,8 @@ int rd_kafka_q_serve (rd_kafka_q_t *rkq, int timeout_ms,
 		return 0;
 	}
 
+	RD_TRACE3(librdkafka, rd_kafka_q_serve_serving, rkq, rkq->rkq_qlen, rkq->rkq_qsize);
+
 	/* Move the first `max_cnt` ops. */
 	rd_kafka_q_init(&localq, rkq->rkq_rk);
 	rd_kafka_q_move_cnt(&localq, rkq, max_cnt == 0 ? -1/*all*/ : max_cnt,
@@ -502,7 +505,7 @@ int rd_kafka_q_serve (rd_kafka_q_t *rkq, int timeout_ms,
 	/* Call callback for each op */
         while ((rko = TAILQ_FIRST(&localq.rkq_q))) {
                 rd_kafka_op_res_t res;
-
+                RD_TRACE4(librdkafka, rd_kafka_q_serve_handling, rkq, rkq->rkq_qlen, rkq->rkq_qsize, rko);
                 rd_kafka_q_deq0(&localq, rko);
                 res = rd_kafka_op_handle(rk, &localq, rko, cb_type,
                                          opaque, callback);

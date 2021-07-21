@@ -388,6 +388,7 @@ rd_kafka_q_enq0 (rd_kafka_q_t *rkq, rd_kafka_op_t *rko, int at_head) {
                             rko_link, rd_kafka_op_cmp_prio);
     rkq->rkq_qlen++;
     rkq->rkq_qsize += rko->rko_len;
+    RD_TRACE4(librdkafka, rd_kafka_q_enc0_enqueuing, rkq, rkq->rkq_qlen, rkq->rkq_qsize, rko);
 }
 
 
@@ -498,6 +499,7 @@ void rd_kafka_q_deq0 (rd_kafka_q_t *rkq, rd_kafka_op_t *rko) {
         TAILQ_REMOVE(&rkq->rkq_q, rko, rko_link);
         rkq->rkq_qlen--;
         rkq->rkq_qsize -= rko->rko_len;
+        RD_TRACE4(librdkafka, rd_kafka_q_deq0_dequeuing, rkq, rkq->rkq_qlen, rkq->rkq_qsize, rko);
 }
 
 
@@ -561,6 +563,7 @@ int rd_kafka_q_concat0 (rd_kafka_q_t *rkq, rd_kafka_q_t *srcq, int do_lock) {
 			rd_kafka_q_io_event(rkq);
                 rkq->rkq_qlen += srcq->rkq_qlen;
                 rkq->rkq_qsize += srcq->rkq_qsize;
+                RD_TRACE3(librdkafka, rd_kafka_q_concat0_concat, rkq, rkq->rkq_qlen, rkq->rkq_qsize);
 		cnd_signal(&rkq->rkq_cond);
 
                 rd_kafka_q_mark_served(srcq);

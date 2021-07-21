@@ -3920,7 +3920,7 @@ rd_kafka_event_t *rd_kafka_queue_poll (rd_kafka_queue_t *rkqu, int timeout_ms) {
 
         if (!rko)
                 return NULL;
-
+        RD_TRACE2(librdkafka, rd_kafka_queue_poll_polled, rkqu, rko);
         return rko;
 }
 

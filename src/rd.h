@@ -88,6 +88,19 @@
 #define LOG_DEBUG   7
 #endif
 
+#if ENABLE_USDT
+#include <sys/sdt.h>
+#define RD_TRACE1(provider, name, val1) DTRACE_PROBE1(provider, name, val1)
+#define RD_TRACE2(provider, name, val1, val2) DTRACE_PROBE2(provider, name, val1, val2)
+#define RD_TRACE3(provider, name, val1, val2, val3) DTRACE_PROBE3(provider, name, val1, val2, val3)
+#define RD_TRACE4(provider, name, val1, val2, val3, val4) DTRACE_PROBE4(provider, name, val1, val2, val3, val4)
+#else
+#define RD_TRACE1(provider, name, val1) do {} while (0)
+#define RD_TRACE2(provider, name, val1, val2) do {} while (0)
+#define RD_TRACE3(provider, name, val1, val2, val3) do {} while (0)
+#define RD_TRACE4(provider, name, val1, val2, val3, val4) do {} while (0)
+#endif
+
 
 /* Debug assert, only enabled with --enable-devel */
 #if ENABLE_DEVEL == 1
@@ -120,22 +133,26 @@
 static RD_INLINE RD_UNUSED void *rd_calloc(size_t num, size_t sz) {
 	void *p = calloc(num, sz);
 	rd_assert(p);
+	RD_TRACE1(librdkafka, rd_calloc, p);
 	return p;
 }
 
 static RD_INLINE RD_UNUSED void *rd_malloc(size_t sz) {
 	void *p = malloc(sz);
 	rd_assert(p);
+	RD_TRACE1(librdkafka, rd_malloc, p);
 	return p;
 }
 
 static RD_INLINE RD_UNUSED void *rd_realloc(void *ptr, size_t sz) {
 	void *p = realloc(ptr, sz);
 	rd_assert(p);
+	RD_TRACE2(librdkafka, rd_realloc, ptr, p);
 	return p;
 }
 
 static RD_INLINE RD_UNUSED void rd_free(void *ptr) {
+	RD_TRACE1(librdkafka, rd_free, ptr);
 	free(ptr);
 }
 
@@ -146,6 +163,7 @@ static RD_INLINE RD_UNUSED char *rd_strdup(const char *s) {
 	char *n = _strdup(s);
 #endif
 	rd_assert(n);
+	RD_TRACE1(librdkafka, rd_strdup, n);
 	return n;
 }
 
@@ -153,6 +171,7 @@ static RD_INLINE RD_UNUSED char *rd_strndup(const char *s, size_t len) {
 #if HAVE_STRNDUP
 	char *n = strndup(s, len);
 	rd_assert(n);
+	RD_TRACE1(librdkafka, rd_strndup, n);
 #else
 	char *n = (char *)rd_malloc(len + 1);
 	rd_assert(n);
